@@ -1,0 +1,25 @@
+name: ota-release
+
+# Runs the OTA pre-release exporter on a schedule. It only publishes a new GitHub Release
+# when NVIDIA's OTA manifest reports a version newer than the latest release tag.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # every 6 hours
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export + release on new OTA version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: ./New-OtaRelease.ps1 -Channel Staging

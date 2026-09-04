@@ -16,6 +16,26 @@ sl.dlss.dll / sl.dlss_d.dll / sl.dlss_g.dll / sl.deepdvc.dll / sl.nis.dll / sl.n
 export-summary.txt  per-file version + SHA-256
 ```
 
+## Automated releases
+
+`.github/workflows/ota-release.yml` runs every 6 hours (and on demand via *Run workflow*).
+It calls `New-OtaRelease.ps1`, which:
+
+1. exports the current staging OTA state (the pipeline above),
+2. builds the release tag `v<dlss>-sl<streamline>` (e.g. `v310.9.0-sl2.14.0`),
+3. **exits without publishing** if a release with that tag already exists — so a release only
+   appears when NVIDIA ships a new OTA version,
+4. otherwise packs the DLLs into a flat **7z** (same drop-in layout as a game folder), attaches
+   `checksums.txt`, and publishes release notes with a real changelog: version deltas, per-file
+   added/changed/removed diff (by SHA-256 against the previous release's checksums), and the
+   public-SDK lag table.
+
+Local run (uses your `gh` login):
+
+```powershell
+./New-OtaRelease.ps1
+```
+
 ## Usage
 
 ```powershell

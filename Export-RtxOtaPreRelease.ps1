@@ -209,6 +209,9 @@ $components = @(
     @{ Section = 'dlssd'; Dll = 'nvngx_dlssd.dll' },
     @{ Section = 'dlssg'; Dll = 'nvngx_dlssg.dll' }
 )
+if (Get-OtaSectionVersion $manifest 'dlssnr') {
+    $components += @{ Section = 'dlssnr'; Dll = 'nvngx_dlssnr.dll' }
+}
 foreach ($c in $components) {
     $manifestVer = (Get-Variable -Name ("ver" + $c.Section)).Value
     $dllPath = Join-Path $OutDir $c.Dll
