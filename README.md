@@ -1,5 +1,9 @@
 # nvidia-rtx-ota-export
 
+[![Latest Release](https://img.shields.io/github/v/release/Talya1412/nvidia-rtx-ota-export?color=76b900&label=latest%20OTA)](https://github.com/Talya1412/nvidia-rtx-ota-export/releases/latest)
+[![ota-release](https://github.com/Talya1412/nvidia-rtx-ota-export/actions/workflows/ota-release.yml/badge.svg)](https://github.com/Talya1412/nvidia-rtx-ota-export/actions/workflows/ota-release.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Automated, unattended exporter for the **newest NVIDIA RTX DLLs** shipped over NVIDIA's NGX OTA
 channel — the DLSS Super Resolution / Ray Reconstruction / Frame Generation runtime and the
 Streamline plugin set — including the **pre-release staging channel** that runs ahead of every
@@ -16,12 +20,16 @@ sl.dlss.dll / sl.dlss_d.dll / sl.dlss_g.dll / sl.deepdvc.dll / sl.nis.dll / sl.n
 export-summary.txt  per-file version + SHA-256
 ```
 
+> The exporter automatically includes `nvngx_dlssnr.dll` (DLSS Neural Rendering) once NVIDIA's
+> OTA manifest starts serving a `dlssnr` section.
+
 ## Automated releases
 
-`.github/workflows/ota-release.yml` runs every 6 hours (and on demand via *Run workflow*).
+`.github/workflows/ota-release.yml` runs **weekly** (Monday 09:00 UTC) and on demand via
+*Run workflow* (with a channel picker: Staging pre-release or Production).
 It calls `New-OtaRelease.ps1`, which:
 
-1. exports the current staging OTA state (the pipeline above),
+1. exports the current OTA state of the selected channel (the pipeline above),
 2. builds the release tag `v<dlss>-sl<streamline>` (e.g. `v310.9.0-sl2.14.0`),
 3. **exits without publishing** if a release with that tag already exists — so a release only
    appears when NVIDIA ships a new OTA version,
