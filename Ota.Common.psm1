@@ -55,9 +55,9 @@ function Compare-OtaNewer([string]$A, [string]$B) {
     try { return ([version]$A -gt [version]$B) } catch { return $false }
 }
 
-# dlssnr mirror selection: candidates @{ Tag; Version; Pass }. Returns the Tag of the newest
-# build whose signature gate PASSED (numeric version compare); $null when none pass. List
-# order breaks version ties (newest release first from the GitHub API).
+# dlssnr selection: candidates @{ Tag; Version; Pass }. Returns the newest build whose PE gate
+# passed (numeric version compare); $null when none pass. List order breaks version ties (newest
+# release first from the GitHub API).
 function Select-DlssnrBuild([object[]]$Candidates) {
     $best = $null; $bestV = $null
     foreach ($c in @($Candidates)) {
@@ -127,7 +127,39 @@ function Test-ReleaseTagNewer([string]$Dlss, [string]$Sl, [string]$ExistingTag) 
     return [bool](Compare-OtaNewer $Sl $v.Sl)
 }
 
-Export-ModuleMember -Function @(
+# Core DLL policy: sources are allowlisted upstream, so the file gate requires a PE/MZ image and
+# reports Authenticode instead of rejecting HashMismatch/NotSigned builds. This keeps the risk
+# visible in export-summary.txt while allowing working community variants.
+function Get-DllAcceptancePolicy([bool]$IsPe, [string]$SignatureStatus, [string]$SignerSubject) {
+    if (-not $IsPe) {
+        return [pscustomobject]@{ Accepted = $false; Label = 'FAILED (not PE)' }
+    }
+    if (($SignatureStatus -eq 'Valid') -and ($SignerSubject -match 'NVIDIA Corporation')) {
+        return [pscustomobject]@{ Accepted = $true; Label = 'Valid (NVIDIA)' }
+    }
+    $status = if ($SignatureStatus) { $SignatureStatus } else { 'Unknown' }
+    return [pscustomobject]@{ Accepted = $true; Label = "UNVERIFIED ($status)" }
+}
+
+# Exact, case-insensitive SHA-256 pin for a deliberately selected unverified artifact.
+function Test-Sha256Pin([string]$Actual, [string]$Expected) {
+    if (-not $Actual -or -not $Expected) { return $false }
+    return [bool]($Actual.Trim().ToLowerInvariant() -eq $Expected.Trim().ToLowerInvariant())
+}
+
+# Deliberately selected universal dlssnr artifact supplied by the user. The URL is fetchable by
+# CI; the DLL hash is immutable. It is an UNVERIFIED exception, never a blanket signature bypass.
+function Get-UnverifiedDlssnrSpec {
+    return [pscustomobject]@{
+        AssetName = 'nvngx_dlssnr-universal-310.8.0-UNVERIFIED.zip'
+        Url       = 'https://github.com/Talya1412/nvidia-rtx-ota-export/releases/download/v310.9.1-sl2.14.1/nvngx_dlssnr-universal-310.8.0-UNVERIFIED.zip'
+        Sha256    = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
+        Version   = '310.8.0'
+        Source    = 'Talya1412/nvidia-rtx-ota-export (user-pinned artifact)'
+    }
+}
+
+ Export-ModuleMember -Function @(
     'Find-OtaCachedPayload',
     'Get-OtaSectionVersion',
     'ConvertTo-PackedVersion',
@@ -139,5 +171,8 @@ Export-ModuleMember -Function @(
     'Get-ReleaseTagVersion',
     'Get-NewestReleaseTag',
     'Select-DlssnrBuild',
+    'Get-DllAcceptancePolicy',
+    'Test-Sha256Pin',
+    'Get-UnverifiedDlssnrSpec',
     'Test-ReleaseTagNewer'
 )

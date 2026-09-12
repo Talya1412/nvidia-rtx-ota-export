@@ -12,8 +12,8 @@
      payloads), and the SDK zip (bin/x64 only).
   3. Pick the per-component winner (numeric compare; ties prefer the SDK repo): DLSS DLLs
      from one source, Streamline plugins from another - always the newest available of each.
-  4. Verify: OTA payloads against NVIDIA's published SHA-256 sidecars; every exported file
-     must be an MZ PE signed (Valid) by NVIDIA Corporation.
+  4. Verify: OTA payloads against NVIDIA's published SHA-256 sidecars; every exported file must be
+     an MZ PE. Authenticode status is reported, but it is not a hard rejection for allowlisted sources.
   5. Optional -Zip: package the output into a single ZIP.
 
   Endpoints (reverse-engineered from NVIDIA's own Streamline OTA client, sl.ota/ota.cpp, registry
@@ -126,25 +126,39 @@ function Test-SidecarSha256([string]$FilePath, [string]$SidecarUrl) {
     return $true
 }
 
-function Test-VerifiedNvidiaDll([string]$Path) {
+function Get-DllVerification([string]$Path) {
     $fs = [System.IO.File]::OpenRead($Path)
     try {
         $magic = New-Object byte[] 2
         [void]$fs.Read($magic, 0, 2)
         if (($magic[0] -ne 0x4D) -or ($magic[1] -ne 0x5A)) {
             Write-Warn2 "$([System.IO.Path]::GetFileName($Path)): not a PE image (MZ header missing)."
-            return $false
+            return [pscustomobject]@{ Accepted = $false; Label = 'FAILED (not PE)'; Status = 'NotPE'; Signer = '' }
         }
     } finally { $fs.Dispose() }
 
-    $sig = Get-AuthenticodeSignature -FilePath $Path
-    if (($sig.Status -ne 'Valid') -or ($sig.SignerCertificate.Subject -notmatch $SignerPattern)) {
-        Write-Warn2 "$([System.IO.Path]::GetFileName($Path)): signature $($sig.Status), signer '$($sig.SignerCertificate.Subject)'."
-        return $false
+    $status = 'Unavailable'
+    $signer = ''
+    try {
+        $sig = Get-AuthenticodeSignature -FilePath $Path
+        $status = [string]$sig.Status
+        if ($sig.SignerCertificate) { $signer = [string]$sig.SignerCertificate.Subject }
+    } catch { }
+    $policy = Get-DllAcceptancePolicy $true $status $signer
+    if ($policy.Label -like 'UNVERIFIED*') {
+        Write-Warn2 "$([System.IO.Path]::GetFileName($Path)): signature $status, signer '$signer' - accepted as UNVERIFIED (PE-only policy)."
     }
-    return $true
+    return [pscustomobject]@{
+        Accepted = [bool]$policy.Accepted
+        Label    = $policy.Label
+        Status   = $status
+        Signer   = $signer
+    }
 }
 
+# All allowlisted core/SDK DLLs use PE-only acceptance with Authenticode status reported.
+# The universal dlssnr asset is additionally protected by its exact SHA-256 pin; arbitrary
+# mirror candidates use the same PE-only policy.
 # ---------------------------------------------------------------- resolve sources (multi-source newest)
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
@@ -324,82 +338,111 @@ foreach ($ch in 'Staging', 'Production') {
 }
 if ($sdk -and (Test-Path $sdk.Dir)) { Remove-Item $sdk.Dir -Recurse -Force }
 
-# ---------------------------------------------------------------- dlssnr mirror (DLSS 5 neural rendering)
-# NVIDIA's OTA channel and SDK repos do not ship nvngx_dlssnr.dll; the community mirror
-# RankFTW/rhi-repo re-posts NVIDIA builds (some repacked per GPU generation). Only builds that
-# pass the SAME Authenticode gate are eligible - a repacked build (HashMismatch) or an unsigned
-# one is rejected. dlssnr is a per-GPU artifact: it ships as its own zip, never inside the
-# main DLL set. Candidates are tried newest-first, capped at 2 downloads per run.
+# The user's tested all-RTX DLL is a deliberately hash-pinned exception. It is fetched from a
+# release URL available to CI, checked against its immutable DLL SHA-256, labeled UNVERIFIED,
+# and kept outside the main DLL set. Mirror fallbacks use the same PE-only policy.
 $dlssnrNote = ''
 if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
-    Write-Step 'Checking dlssnr mirror (DLSS 5 neural rendering, NVIDIA-signed builds only)'
+    Write-Step 'Checking dlssnr (pinned universal asset first; PE-only mirror fallback)'
+    $unverifiedSpec = Get-UnverifiedDlssnrSpec
+    $pinnedZip = Join-Path $env:TEMP ("pinned-" + $unverifiedSpec.AssetName)
+    $pinnedDir = Join-Path $env:TEMP 'dlssnr-pinned-universal'
+    $pinnedAssetPath = Join-Path $OutDir $unverifiedSpec.AssetName
     try {
-        $snrRels = Get-GitHubJson 'repos/RankFTW/rhi-repo/releases?per_page=100'
-        $snrCands = @()
-        foreach ($r in @($snrRels)) {
-            if ($r.tag_name -notmatch '^dlssnr-(.+)$') { continue }
-            $snrVer = $Matches[1]
-            try { $null = [version]($snrVer -replace '-[A-Za-z0-9.]+$', '') } catch { continue }
-            $snrAsset = @($r.assets) | Where-Object { $_.name -eq "nvngx_dlssnr_$snrVer.zip" } | Select-Object -First 1
-            if ($snrAsset) { $snrCands += @{ Tag = $r.tag_name; Version = $snrVer; Asset = $snrAsset } }
+        Invoke-WebRequest -Uri $unverifiedSpec.Url -OutFile $pinnedZip -UseBasicParsing
+        Expand-ZipSubset $pinnedZip '' $pinnedDir
+        $pinnedDll = Join-Path $pinnedDir 'nvngx_dlssnr.dll'
+        $pinnedHash = Get-FileSha256 $pinnedDll
+        if (-not (Test-Sha256Pin $pinnedHash $unverifiedSpec.Sha256)) {
+            throw "pinned universal DLL SHA-256 mismatch: expected $($unverifiedSpec.Sha256), got $pinnedHash"
         }
-        $snrOrder = @($snrCands | Sort-Object -Property @{ Expression = { [version]($_.Version -replace '-[A-Za-z0-9.]+$', '') }; Descending = $true })
-        $snrChecked = @()
-        foreach ($cand in $snrOrder) {
-            $snrZip = Join-Path $env:TEMP "dlssnr-$($cand.Version).zip"
-            $snrDir = Join-Path $env:TEMP "dlssnr-$($cand.Version)"
-            try {
-                Invoke-WebRequest -Uri $cand.Asset.browser_download_url -OutFile $snrZip -UseBasicParsing
-                Expand-ZipSubset $snrZip '' $snrDir
-                $snrDll = Join-Path $snrDir 'nvngx_dlssnr.dll'
-                $verOk = ConvertTo-ShortVersion (Get-Item $snrDll).VersionInfo.FileVersion
-                $snrPassed = Test-VerifiedNvidiaDll $snrDll
-                $snrChecked += @{ Tag = $cand.Tag; Version = $verOk; Pass = $snrPassed }
-                if ($snrPassed) {
-                    $assetZip = Join-Path $OutDir "nvngx_dlssnr_$($cand.Version).zip"
-                    $snrStage = Join-Path $env:TEMP "dlssnr-stage-$($cand.Version)"
-                    if (Test-Path $snrStage) { Remove-Item $snrStage -Recurse -Force }
-                    New-Item -ItemType Directory -Path $snrStage -Force | Out-Null
-                    Copy-Item $snrDll (Join-Path $snrStage 'nvngx_dlssnr.dll') -Force
-                    [System.IO.Compression.ZipFile]::CreateFromDirectory($snrStage, $assetZip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
-                    Remove-Item $snrStage -Recurse -Force
-                    $dlssnrNote += "- ``nvngx_dlssnr_$($cand.Version).zip`` (from ``RankFTW/rhi-repo`` tag ``$($cand.Tag)``): Authenticode **Valid (NVIDIA Corporation)**.`n"
-                    break
-                } else {
-                    Write-Warn2 "dlssnr $($cand.Version) ($($cand.Tag)): signature FAILED - rejected."
-                    $dlssnrNote += "- ``$($cand.Tag)``: signature FAILED (modified or unsigned build) - rejected by the Authenticode gate.`n"
-                }
-            } catch {
-                Write-Warn2 "dlssnr candidate $($cand.Tag) failed: $($_.Exception.Message)"
-                $dlssnrNote += "- ``$($cand.Tag)``: fetch failed ($($_.Exception.Message)).`n"
-            } finally {
-                if (Test-Path $snrZip) { Remove-Item $snrZip -Force }
-                if (Test-Path $snrDir) { Remove-Item $snrDir -Recurse -Force }
-            }
-        }
-        $snrBest = Select-DlssnrBuild $snrChecked
-        if (-not $snrBest) { Write-Info 'No NVIDIA-signed dlssnr build available - skipped.' }
+        $pinnedVerification = Get-DllVerification $pinnedDll
+        if (-not $pinnedVerification.Accepted) { throw 'pinned universal dlssnr is not a PE image' }
+        $pinnedStage = Join-Path $env:TEMP 'dlssnr-pinned-stage'
+        if (Test-Path $pinnedStage) { Remove-Item $pinnedStage -Recurse -Force }
+        New-Item -ItemType Directory -Path $pinnedStage -Force | Out-Null
+        Copy-Item $pinnedDll (Join-Path $pinnedStage 'nvngx_dlssnr.dll') -Force
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($pinnedStage, $pinnedAssetPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+        Remove-Item $pinnedStage -Recurse -Force
+        $dlssnrNote = "- ``$($unverifiedSpec.AssetName)`` (user-pinned universal build, version $($unverifiedSpec.Version)): **UNVERIFIED** Authenticode status; exact DLL SHA-256 ``$pinnedHash`` matches the immutable pin. Source: ``$($unverifiedSpec.Source)``.`n"
+        Write-Info "dlssnr universal: pinned SHA-256 verified; publishing $($unverifiedSpec.AssetName)."
     } catch {
-        Write-Warn2 "dlssnr mirror unreachable: $($_.Exception.Message) - skipped."
+        Write-Warn2 "Pinned universal dlssnr unavailable: $($_.Exception.Message) - trying PE-only mirror fallback."
+        $dlssnrNote = "- Pinned universal asset unavailable: $($_.Exception.Message).`n"
+    } finally {
+        if (Test-Path $pinnedZip) { Remove-Item $pinnedZip -Force }
+        if (Test-Path $pinnedDir) { Remove-Item $pinnedDir -Recurse -Force }
+    }
+
+    if (-not (Test-Path $pinnedAssetPath)) {
+        try {
+            $snrRels = Get-GitHubJson 'repos/RankFTW/rhi-repo/releases?per_page=100'
+            $snrCands = @()
+            foreach ($r in @($snrRels)) {
+                if ($r.tag_name -notmatch '^dlssnr-(.+)$') { continue }
+                $snrVer = $Matches[1]
+                try { $null = [version]($snrVer -replace '-[A-Za-z0-9.]+$', '') } catch { continue }
+                $snrAsset = @($r.assets) | Where-Object { $_.name -eq "nvngx_dlssnr_$snrVer.zip" } | Select-Object -First 1
+                if ($snrAsset) { $snrCands += @{ Tag = $r.tag_name; Version = $snrVer; Asset = $snrAsset } }
+            }
+            $snrOrder = @($snrCands | Sort-Object -Property @{ Expression = { [version]($_.Version -replace '-[A-Za-z0-9.]+$', '') }; Descending = $true })
+            $snrChecked = @()
+            foreach ($cand in $snrOrder) {
+                $snrZip = Join-Path $env:TEMP "dlssnr-$($cand.Version).zip"
+                $snrDir = Join-Path $env:TEMP "dlssnr-$($cand.Version)"
+                try {
+                    Invoke-WebRequest -Uri $cand.Asset.browser_download_url -OutFile $snrZip -UseBasicParsing
+                    Expand-ZipSubset $snrZip '' $snrDir
+                    $snrDll = Join-Path $snrDir 'nvngx_dlssnr.dll'
+                    $verOk = ConvertTo-ShortVersion (Get-Item $snrDll).VersionInfo.FileVersion
+                    $snrPassed = (Get-DllVerification $snrDll).Accepted
+                    $snrChecked += @{ Tag = $cand.Tag; Version = $verOk; Pass = $snrPassed }
+                    if ($snrPassed) {
+                        $assetZip = Join-Path $OutDir "nvngx_dlssnr_$($cand.Version).zip"
+                        $snrStage = Join-Path $env:TEMP "dlssnr-stage-$($cand.Version)"
+                        if (Test-Path $snrStage) { Remove-Item $snrStage -Recurse -Force }
+                        New-Item -ItemType Directory -Path $snrStage -Force | Out-Null
+                        Copy-Item $snrDll (Join-Path $snrStage 'nvngx_dlssnr.dll') -Force
+                        [System.IO.Compression.ZipFile]::CreateFromDirectory($snrStage, $assetZip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+                        Remove-Item $snrStage -Recurse -Force
+                        $dlssnrNote += "- ``nvngx_dlssnr_$($cand.Version).zip`` (mirror tag ``$($cand.Tag)``): $((Get-DllVerification $snrDll).Label).`n"
+                        break
+                    } else {
+                        Write-Warn2 "dlssnr $($cand.Version) ($($cand.Tag)): rejected because it is not a valid PE image."
+                        $dlssnrNote += "- ``$($cand.Tag)``: not a valid PE image - rejected.`n"
+                    }
+                } catch {
+                    Write-Warn2 "dlssnr candidate $($cand.Tag) failed: $($_.Exception.Message)"
+                    $dlssnrNote += "- ``$($cand.Tag)``: fetch or validation failed ($($_.Exception.Message)).`n"
+                } finally {
+                    if (Test-Path $snrZip) { Remove-Item $snrZip -Force }
+                    if (Test-Path $snrDir) { Remove-Item $snrDir -Recurse -Force }
+                }
+            }
+            if (@($snrChecked | Where-Object { $_.Pass }).Count -eq 0) { Write-Info 'No PE dlssnr mirror build available - skipped.' }
+        } catch {
+            Write-Warn2 "dlssnr mirror unreachable: $($_.Exception.Message) - skipped."
+        }
     }
 }
 if ($dlssnrNote) {
     $dlssnrNotePath = Join-Path $OutDir 'dlssnr-notes.txt'
-    $dlssnrHeader = "DLSS 5 Neural Rendering (nvngx_dlssnr.dll) - per-GPU artifact, shipped separately from the main DLL set.`nSource: RankFTW/rhi-repo (NVIDIA-signed builds only; every file re-verified against NVIDIA's Authenticode signature).`n`n"
+    $dlssnrHeader = "DLSS 5 Neural Rendering (nvngx_dlssnr.dll) - per-GPU artifact, shipped separately from the main DLL set.`n"
     Set-Content -Path $dlssnrNotePath -Value ($dlssnrHeader + $dlssnrNote) -Encoding UTF8
 }
 
-Write-Step 'Authenticode + PE verification of exported files'
+Write-Step 'PE validation + signature reporting'
 $report = @()
-$allValid = $true
+$allAccepted = $true
 Get-ChildItem $OutDir -Filter '*.dll' | Sort-Object Name | ForEach-Object {
-    $ok = Test-VerifiedNvidiaDll $_.FullName
-    if (-not $ok) { $allValid = $false }
+    $verification = Get-DllVerification $_.FullName
+    $ok = $verification.Accepted
+    if (-not $ok) { $allAccepted = $false }
     $report += [pscustomobject]@{
         File     = $_.Name
         SizeMB   = [math]::Round($_.Length / 1MB, 1)
         Version  = $_.VersionInfo.FileVersion
-        Signed   = if ($ok) { 'Valid (NVIDIA)' } else { 'FAILED' }
+        Signed   = $verification.Label
         Sha256   = Get-FileSha256 $_.FullName
     }
 }
@@ -408,7 +451,7 @@ $summaryPath = Join-Path $OutDir 'export-summary.txt'
 $report | ForEach-Object { "{0}`t{1}`t{2}`t{3}" -f $_.File, $_.Version, $_.Signed, $_.Sha256 } |
     Set-Content -Path $summaryPath -Encoding UTF8
 
-if (-not $allValid) { throw 'One or more exported files failed verification - inspect output above.' }
+if (-not $allAccepted) { throw 'One or more exported files failed PE validation - inspect output above.' }
 
 if ($Zip) {
     Write-Step 'Packaging ZIP into Downloads'

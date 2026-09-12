@@ -10,7 +10,7 @@ Ray Reconstruction / Frame Generation runtime and the Streamline plugin set — 
 channels, plus the official **Streamline SDK** GitHub releases. Each component (DLSS, Streamline)
 independently comes from whichever feed is newest.
 
-One command (or double-click `run-export.bat`) produces a verified folder of drop-in DLLs:
+One command (or double-click `run-export.bat`) produces a PE-validated folder of drop-in DLLs:
 
 ```
 nvngx_dlss.dll      DLSS Super Resolution   (newest available build, e.g. 310.9.1)
@@ -18,13 +18,13 @@ nvngx_dlssd.dll     DLSS Ray Reconstruction
 nvngx_dlssg.dll     DLSS Frame Generation
 sl.common.dll       Streamline 2.x runtime plugins
 sl.dlss.dll / sl.dlss_d.dll / sl.dlss_g.dll / sl.deepdvc.dll / sl.nis.dll / sl.nvperf.dll / sl.pcl.dll / sl.reflex.dll
-export-summary.txt  per-file version + SHA-256
+export-summary.txt  per-file version + signature status + SHA-256
 export-sources.txt  which feed won each component (dlss=/sl=) + all feeds compared
 ```
 
-> The exporter automatically includes `nvngx_dlssnr.dll` (DLSS Neural Rendering) once any feed
-> starts serving a `dlssnr` payload, and picks up extra SDK-only DLLs (`nvngx_deepdvc.dll`,
-> `sl.directsr.dll`, `sl.interposer.dll`) whenever the Streamline SDK zip is the winning set.
+> `Newest` also packages DLSS 5 Neural Rendering as a separate per-GPU asset. The universal build
+> is accepted only when its exact SHA-256 pin matches; its Authenticode status is reported as
+> **UNVERIFIED**. Core DLSS/Streamline signatures are reported, not used as a hard reject.
 
 ## Automated releases
 
@@ -77,9 +77,9 @@ Or double-click `run-export.bat`.
    **production** (same switch as NVIDIA's own Streamline OTA client: registry `NGXCore\CDNServerType`,
    `0 - production / 1 - staging`, see `sl.ota/ota.cpp` in the Streamline SDK).
    In **Newest** mode (the default) all feeds are compared and each component comes from the
-   newest one (ties prefer the Streamline SDK repo). A dlssnr mirror (RankFTW/rhi-repo)
-   additionally supplies DLSS 5 Neural Rendering builds — NVIDIA-signed only; repacked or
-   unsigned variants are rejected and documented in release notes.
+   newest one (ties prefer the Streamline SDK repo). DLSS 5 Neural Rendering also comes from the
+   user-pinned universal asset when its exact SHA-256 matches; Authenticode status is reported,
+   not used as a hard reject for allowlisted DLSS/Streamline sources or mirror candidates.
 2. **Resolve versions** — OTA: reads `app_E658700` / `app_E658703` generic app pins for sections
    `dlss`, `dlssd`, `dlssg`, `dlss_override` (the Streamline bundle); SDK: reads the DLL
    FileVersions inside the Streamline SDK zip (`bin/x64`, production flavor).
@@ -89,8 +89,9 @@ Or double-click `run-export.bat`.
    refresh whenever any OTA manifest pin is strictly newer than an exported DLL. OTA payloads
    are checked against NVIDIA's published `.sha256` sidecars.
    Packed version layout: `(major << 16) | (minor << 8) | patch` — e.g. 310.9.0 → 20318464.
-4. **Authenticode gate** — every exported file must be a valid PE signed (Valid) by
-   *NVIDIA Corporation*; anything else aborts the run.
+4. **PE gate + signature report** — every exported file must be a valid PE/MZ image. Authenticode
+   status is recorded (`Valid (NVIDIA)` or `UNVERIFIED (...)`), but `Valid` is not required for
+   allowlisted DLSS/Streamline sources. OTA payloads still require the NVIDIA SHA-256 sidecar.
 5. **Output + optional ZIP** — writes `export-summary.txt` / `export-sources.txt` and, with
    `-Zip`, a ready-to-share archive.
 
@@ -100,11 +101,12 @@ OTA staging served 310.9.0 / 2.14.0 and OTA production 310.7.128 / 2.12.128 — 
 
 ## Notes
 
-- The staging channel is a **pre-release** feed: real, NVIDIA-signed builds, but the driver will not
-  serve them to a game unless an override points at them.
-- The DLSS SDK (headers/samples) is intentionally **not** downloaded here — only runtime DLLs.
-  Official SDKs: <https://github.com/NVIDIA/DLSS>, <https://github.com/NVIDIA-RTX/Streamline>.
-- Requires Windows 10/11 with an NVIDIA GPU (Authenticode verification) and internet access.
+- Every exported DLL must be a valid PE/MZ image. Authenticode status is recorded as
+  `Valid (NVIDIA)` or `UNVERIFIED (...)`, but it is not a hard reject for allowlisted
+  DLSS/Streamline sources. OTA payloads still require NVIDIA's SHA-256 sidecar.
+- The universal `dlssnr` asset is accepted only when its immutable SHA-256 pin matches;
+  its filename and release notes explicitly identify it as `UNVERIFIED`.
+- Requires Windows 10/11 with an NVIDIA GPU (PE validation; signatures are reported, not required) and internet access.
 - Endpoint provenance and the payload-layout reverse engineering draw on
   [scubamount/dlss-version-toolkit](https://github.com/scubamount/dlss-version-toolkit) (Apache-2.0).
 

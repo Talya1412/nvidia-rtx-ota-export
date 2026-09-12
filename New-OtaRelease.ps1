@@ -90,6 +90,13 @@ $dlssVer = ConvertTo-ShortVersion (Get-Item (Join-Path $work 'nvngx_dlss.dll')).
 $slVer   = ConvertTo-ShortVersion (Get-Item (Join-Path $work 'sl.common.dll')).VersionInfo.FileVersion
 $tag = "v$dlssVer-sl$slVer"
 Write-Host "    DLSS $dlssVer / Streamline $slVer -> tag $tag"
+$signatureRows = @()
+if (Test-Path (Join-Path $work 'export-summary.txt')) {
+    foreach ($line in (Get-Content (Join-Path $work 'export-summary.txt'))) {
+        $p = $line -split "`t"
+        if ($p.Count -ge 3 -and $p[2] -match 'UNVERIFIED') { $signatureRows += "- ``$($p[0])``: **$($p[2])**" }
+    }
+}
 
 # ---------------------------------------------------------------- 2. gate: only release on new version
 if (-not $Repo) {
@@ -147,9 +154,9 @@ $notes = @"
 
 Exported from the **newest available feed** - per-component winner across NGX OTA
 staging/production and the official Streamline SDK releases
-([NVIDIA-RTX/Streamline](https://github.com/NVIDIA-RTX/Streamline)). Every file is
-Authenticode-signed by **NVIDIA Corporation**; OTA payloads are also SHA-256-verified
-against NVIDIA's published sidecars.
+([NVIDIA-RTX/Streamline](https://github.com/NVIDIA-RTX/Streamline)). Every exported DLL is a
+valid PE/MZ image. Authenticode status is recorded for transparency; OTA payloads are also
+SHA-256-verified against NVIDIA's published sidecars.
 
 | Component | This release | Source |
 |---|---|---|
@@ -164,6 +171,9 @@ Public SDK (reference): DLSS $ghDlss, Streamline $ghSl
 ## Changelog
 
 "@
+if ($signatureRows.Count) {
+    $notes += "`n## Signature status warnings`n`n" + ($signatureRows -join "`n") + "`n"
+}
 if (-not $prevTag) {
     $notes += "`n- First tracked release. Baseline: DLSS $dlssVer, Streamline $slVer.`n"
 } else {
@@ -175,7 +185,7 @@ if (-not $prevTag) {
     if (-not $changed.Count -and -not $added.Count -and -not $removed.Count) { $notes += "- No file content changed (version bump only).`n" }
 }
 # DLSS 5 Neural Rendering (dlssnr) section when the export produced one
-$snrAssets = @(Get-ChildItem $work -Filter 'nvngx_dlssnr_*.zip' -ErrorAction SilentlyContinue)
+$snrAssets = @(Get-ChildItem $work -Filter 'nvngx_dlssnr*.zip' -ErrorAction SilentlyContinue)
 if ($snrAssets.Count -gt 0) {
     $snrNotePath = Join-Path $work 'dlssnr-notes.txt'
     if (Test-Path $snrNotePath) {
@@ -192,7 +202,7 @@ $notes += @"
   ``nvngx_dlssg.dll`` -> Frame Generation, ``sl.*.dll`` -> Streamline runtime (games using SL).
 - Drop next to the game exe (or via DLSS Swapper / NGX override). Flat layout, no subfolders.
 
-> Binaries are NVIDIA-copyrighted, fetched from NVIDIA's own CDN / official SDK releases for personal use.
+> Binaries are NVIDIA-copyrighted, fetched from NVIDIA's own CDN / official SDK releases / explicitly pinned user artifacts for personal use.
 "@
 $notesPath = Join-Path $work 'release-notes.md'
 $notes | Set-Content $notesPath -Encoding UTF8

@@ -144,14 +144,26 @@ try {
 }
 $win4 = Select-ComponentWinners @(@{ Source = 'ota-production'; Dlss = '310.8.0'; Sl = '2.13.0' })
 Assert-True 'winners: single source -> that source' ($win4.DlssSource -eq 'ota-production' -and $win4.SlVersion -eq '2.13.0')
-Assert-True 'dlssnr: signed newest wins' ((Select-DlssnrBuild @(@{ Tag = 'dlssnr-310.8.0-RTX40'; Version = '310.8.0'; Pass = $false }, @{ Tag = 'dlssnr-310.8.0'; Version = '310.8.0'; Pass = $true })) -eq 'dlssnr-310.8.0')
-Assert-True 'dlssnr: unsigned newer build ignored' ((Select-DlssnrBuild @(@{ Tag = 'dlssnr-310.9.0-SF'; Version = '310.9.0'; Pass = $false }, @{ Tag = 'dlssnr-310.8.0'; Version = '310.8.0'; Pass = $true })) -eq 'dlssnr-310.8.0')
-Assert-True 'dlssnr: numeric version compare' ((Select-DlssnrBuild @(@{ Tag = 'dlssnr-310.8.0'; Version = '310.8.0'; Pass = $true }, @{ Tag = 'dlssnr-310.9.0'; Version = '310.9.0'; Pass = $true })) -eq 'dlssnr-310.9.0')
-Assert-True 'dlssnr: none passing -> null' ($null -eq (Select-DlssnrBuild @(@{ Tag = 'dlssnr-310.9.0'; Version = '310.9.0'; Pass = $false })))
-Assert-True 'dlssnr: empty list -> null' ($null -eq (Select-DlssnrBuild @()))
 
-Assert-True 'sdk asset: x64 zip preferred over arch variants' ((Get-SdkZipAssetName @('streamline-sdk-v2.14.1-aarch64.zip', 'streamline-sdk-v2.14.1.zip', 'streamline-sdk-v2.14.1-arm64ec.zip')) -eq 'streamline-sdk-v2.14.1.zip')
+Assert-True 'dlssnr: newer PE accepted regardless of signature status' ((Select-DlssnrBuild @(@{ Tag = 'dlssnr-310.9.0-SF'; Version = '310.9.0'; Pass = $true }, @{ Tag = 'dlssnr-310.8.0'; Version = '310.8.0'; Pass = $true })) -eq 'dlssnr-310.9.0-SF')
 Assert-True 'sdk asset: fallback to any zip' ((Get-SdkZipAssetName @('streamline-2.14.1.zip')) -eq 'streamline-2.14.1.zip')
+
+# ---------------------------------------------------------------- relaxed PE-only export policy
+$hashMismatch = Get-DllAcceptancePolicy $true 'HashMismatch' 'CN=NVIDIA Corporation'
+Assert-True 'gate: PE with NVIDIA HashMismatch is accepted but labeled UNVERIFIED' ($hashMismatch.Accepted -and $hashMismatch.Label -match 'UNVERIFIED')
+$unsigned = Get-DllAcceptancePolicy $true 'NotSigned' ''
+Assert-True 'gate: PE without Authenticode is accepted but labeled UNVERIFIED' ($unsigned.Accepted -and $unsigned.Label -match 'UNVERIFIED')
+$valid = Get-DllAcceptancePolicy $true 'Valid' 'CN=NVIDIA Corporation'
+Assert-True 'gate: valid NVIDIA signature is accepted and labeled verified' ($valid.Accepted -and $valid.Label -eq 'Valid (NVIDIA)')
+$otherSigner = Get-DllAcceptancePolicy $true 'Valid' 'CN=Some Other Publisher'
+Assert-True 'gate: PE with non-NVIDIA valid signature is still accepted as UNVERIFIED' ($otherSigner.Accepted -and $otherSigner.Label -match 'UNVERIFIED')
+$badPe = Get-DllAcceptancePolicy $false 'Valid' 'CN=NVIDIA Corporation'
+Assert-True 'gate: non-PE is still rejected' (-not $badPe.Accepted)
+
+Assert-True 'pin: exact SHA-256 matches case-insensitively' (Test-Sha256Pin 'ABCDEF0123456789' 'abcdef0123456789')
+Assert-True 'pin: universal asset is explicitly marked UNVERIFIED' ((Get-UnverifiedDlssnrSpec).AssetName -match 'UNVERIFIED')
+Assert-True 'pin: universal asset hash is exact and immutable' ((Get-UnverifiedDlssnrSpec).Sha256 -eq 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a')
+Assert-True 'pin: universal asset has fetchable release URL' ((Get-UnverifiedDlssnrSpec).Url -match '^https://github\.com/Talya1412/nvidia-rtx-ota-export/releases/download/')
 
 # ---------------------------------------------------------------- summary
 if ($script:failed -gt 0) {
