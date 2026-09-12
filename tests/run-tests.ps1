@@ -143,6 +143,11 @@ try {
 }
 $win4 = Select-ComponentWinners @(@{ Source = 'ota-production'; Dlss = '310.8.0'; Sl = '2.13.0' })
 Assert-True 'winners: single source -> that source' ($win4.DlssSource -eq 'ota-production' -and $win4.SlVersion -eq '2.13.0')
+Assert-True 'dlssnr: signed newest wins' ((Select-DlssnrBuild @(@{ Tag = 'dlssnr-310.8.0-RTX40'; Version = '310.8.0'; Pass = $false }, @{ Tag = 'dlssnr-310.8.0'; Version = '310.8.0'; Pass = $true })) -eq 'dlssnr-310.8.0')
+Assert-True 'dlssnr: unsigned newer build ignored' ((Select-DlssnrBuild @(@{ Tag = 'dlssnr-310.9.0-SF'; Version = '310.9.0'; Pass = $false }, @{ Tag = 'dlssnr-310.8.0'; Version = '310.8.0'; Pass = $true })) -eq 'dlssnr-310.8.0')
+Assert-True 'dlssnr: numeric version compare' ((Select-DlssnrBuild @(@{ Tag = 'dlssnr-310.8.0'; Version = '310.8.0'; Pass = $true }, @{ Tag = 'dlssnr-310.9.0'; Version = '310.9.0'; Pass = $true })) -eq 'dlssnr-310.9.0')
+Assert-True 'dlssnr: none passing -> null' ($null -eq (Select-DlssnrBuild @(@{ Tag = 'dlssnr-310.9.0'; Version = '310.9.0'; Pass = $false })))
+Assert-True 'dlssnr: empty list -> null' ($null -eq (Select-DlssnrBuild @()))
 
 Assert-True 'sdk asset: x64 zip preferred over arch variants' ((Get-SdkZipAssetName @('streamline-sdk-v2.14.1-aarch64.zip', 'streamline-sdk-v2.14.1.zip', 'streamline-sdk-v2.14.1-arm64ec.zip')) -eq 'streamline-sdk-v2.14.1.zip')
 Assert-True 'sdk asset: fallback to any zip' ((Get-SdkZipAssetName @('streamline-2.14.1.zip')) -eq 'streamline-2.14.1.zip')

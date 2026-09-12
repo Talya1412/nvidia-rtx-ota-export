@@ -55,6 +55,19 @@ function Compare-OtaNewer([string]$A, [string]$B) {
     try { return ([version]$A -gt [version]$B) } catch { return $false }
 }
 
+# dlssnr mirror selection: candidates @{ Tag; Version; Pass }. Returns the Tag of the newest
+# build whose signature gate PASSED (numeric version compare); $null when none pass. List
+# order breaks version ties (newest release first from the GitHub API).
+function Select-DlssnrBuild([object[]]$Candidates) {
+    $best = $null; $bestV = $null
+    foreach ($c in @($Candidates)) {
+        if (-not $c -or -not $c.Pass) { continue }
+        try { $v = [version]$c.Version } catch { continue }
+        if (-not $best -or $v -gt $bestV) { $best = $c.Tag; $bestV = $v }
+    }
+    return $best
+}
+
 # Per-component newest across sources. Candidates: @{ Source; Dlss; Sl }. Picks the DLSS winner
 # and the SL winner independently (numeric compare). Ties prefer the official Streamline SDK
 # (GitHub) over OTA staging over OTA production.
@@ -125,5 +138,6 @@ Export-ModuleMember -Function @(
     'Get-SdkZipAssetName',
     'Get-ReleaseTagVersion',
     'Get-NewestReleaseTag',
+    'Select-DlssnrBuild',
     'Test-ReleaseTagNewer'
 )
