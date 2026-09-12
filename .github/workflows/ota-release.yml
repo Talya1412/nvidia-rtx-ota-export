@@ -9,11 +9,12 @@ on:
   workflow_dispatch:
     inputs:
       channel:
-        description: 'OTA channel to track (Newest = newer of staging/production)'
+        description: 'Source to track (Newest = per-component newest across OTA + Streamline SDK)'
         type: choice
         default: Newest
         options:
           - Newest
+          - Sdk
           - Staging
           - Production
 

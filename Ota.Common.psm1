@@ -16,6 +16,23 @@ function ConvertTo-PackedVersion([string]$Version) {
     return ($maj -shl 16) -bor ($min -shl 8) -bor $pat
 }
 
+# PE FileVersion with any separators ("310,9,1,0" / "2.14.1.0") -> "310.9.1".
+# Digits only; non-digits become separators (the old comma-DELETING variant merged "310,9,1,0"
+# into "310910" and silently broke every version comparison).
+function ConvertTo-ShortVersion([string]$FileVersion) {
+    $p = ($FileVersion -replace '[^0-9]', '.').Split('.') | Where-Object { $_ -ne '' }
+    return ('{0}.{1}.{2}' -f $p[0], $p[1], $p[2])
+}
+
+# Lowercase hex SHA-256 via the .NET API - deliberately NOT the Get-FileHash cmdlet, which
+# disappears on hosts where PowerShell module autoloading is broken (observed on real machines).
+function ConvertTo-ShortVersion([string]$FileVersion) {
+    $p = @(($FileVersion -replace '[^0-9]', '.').Split('.') | Where-Object { $_ })
+    if ($p.Count -eq 0) { return '' }
+    $maj = $p[0]; $min = if ($p.Count -gt 1) { $p[1] } else { '0' }; $pat = if ($p.Count -gt 2) { $p[2] } else { '0' }
+    return ('{0}.{1}.{2}' -f $maj, $min, $pat)
+}
+
 # Lowercase hex SHA-256 via the .NET API - deliberately NOT the Get-FileHash cmdlet, which
 # disappears on hosts where PowerShell module autoloading is broken (observed on real machines).
 function Get-FileSha256([string]$Path) {
@@ -33,19 +50,32 @@ function Compare-OtaNewer([string]$A, [string]$B) {
     try { return ([version]$A -gt [version]$B) } catch { return $false }
 }
 
-# Picks the channel whose OTA state is newest. Falls back to whichever manifest exists;
-# equal or unreadable versions resolve to Staging (the pre-release feed, historical default).
-function Resolve-NewestChannel([string]$ManifestStaging, [string]$ManifestProduction) {
-    if (-not $ManifestProduction) { return 'Staging' }
-    if (-not $ManifestStaging) { return 'Production' }
-    $vs = Get-OtaSectionVersion $ManifestStaging 'dlss'
-    if (-not $vs) { $vs = Get-OtaSectionVersion $ManifestStaging 'dlss_override' }
-    $vp = Get-OtaSectionVersion $ManifestProduction 'dlss'
-    if (-not $vp) { $vp = Get-OtaSectionVersion $ManifestProduction 'dlss_override' }
-    if (-not $vp) { return 'Staging' }
-    if (-not $vs) { return 'Production' }
-    if (Compare-OtaNewer $vp $vs) { return 'Production' }
-    return 'Staging'
+# Per-component newest across sources. Candidates: @{ Source; Dlss; Sl }. Picks the DLSS winner
+# and the SL winner independently (numeric compare). Ties prefer the official Streamline SDK
+# (GitHub) over OTA staging over OTA production.
+function Select-ComponentWinners([object[]]$Candidates) {
+    $priority = @{ 'sdk-streamline' = 0; 'ota-staging' = 1; 'ota-production' = 2 }
+    $ok = @($Candidates) | Where-Object { $_ -and $_.Source -and $_.Dlss -and $_.Sl }
+    if (-not $ok) { throw 'Select-ComponentWinners: no complete candidates.' }
+    $rank = { if ($priority.ContainsKey($_.Source)) { $priority[$_.Source] } else { 3 } }
+    $byDlss = @($ok | Sort-Object -Property @{ Expression = { [version]$_.Dlss }; Descending = $true },
+                                     @{ Expression = $rank })
+    $bySl   = @($ok | Sort-Object -Property @{ Expression = { [version]$_.Sl }; Descending = $true },
+                                     @{ Expression = $rank })
+    return [pscustomobject]@{
+        DlssSource  = $byDlss[0].Source
+        DlssVersion = $byDlss[0].Dlss
+        SlSource    = $bySl[0].Source
+        SlVersion   = $bySl[0].Sl
+    }
+}
+
+# The x64 Streamline SDK zip asset: streamline-sdk-v<ver>.zip (excludes -aarch64/-arm64ec).
+# Falls back to the first zip when NVIDIA renames assets.
+function Get-SdkZipAssetName([string[]]$AssetNames) {
+    $x64 = @($AssetNames) | Where-Object { $_ -match '^streamline-sdk-v[0-9.]+\.zip$' } | Select-Object -First 1
+    if ($x64) { return $x64 }
+    return (@($AssetNames) | Where-Object { $_ -match '\.zip$' } | Select-Object -First 1)
 }
 
 # 'v310.9.0-sl2.14.0' -> Dlss='310.9.0', Sl='2.14.0'; anything else -> $null
@@ -69,8 +99,8 @@ function Get-NewestReleaseTag([string[]]$Tags) {
 }
 
 # Gate: true only when the candidate (Dlss, Sl) is strictly newer than an existing release tag.
-# Equal version (already released, from either channel) or older -> false, so a stale channel
-# state can never be published and pull 'Latest release' backwards.
+# Equal version (already released, from any source) or older -> false, so a stale state can
+# never be published and pull 'Latest release' backwards.
 function Test-ReleaseTagNewer([string]$Dlss, [string]$Sl, [string]$ExistingTag) {
     $v = Get-ReleaseTagVersion $ExistingTag
     if (-not $v) { return $true }
@@ -82,9 +112,11 @@ function Test-ReleaseTagNewer([string]$Dlss, [string]$Sl, [string]$ExistingTag) 
 Export-ModuleMember -Function @(
     'Get-OtaSectionVersion',
     'ConvertTo-PackedVersion',
+    'ConvertTo-ShortVersion',
     'Get-FileSha256',
     'Compare-OtaNewer',
-    'Resolve-NewestChannel',
+    'Select-ComponentWinners',
+    'Get-SdkZipAssetName',
     'Get-ReleaseTagVersion',
     'Get-NewestReleaseTag',
     'Test-ReleaseTagNewer'

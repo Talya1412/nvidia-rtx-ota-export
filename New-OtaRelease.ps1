@@ -1,19 +1,20 @@
 <#
 .SYNOPSIS
-  Check NVIDIA OTA for a new version (newest of the staging/production channels by default);
-  only when strictly newer than every existing GitHub release, export the DLLs, package a 7z
-  (flat layout) and publish a GitHub Release with changelog notes.
+  Check every tracked NVIDIA feed for a new version (per-component newest of OTA
+  staging/production + Streamline SDK by default); only when strictly newer than every
+  existing GitHub release, export the DLLs, package a 7z (flat layout) and publish a
+  GitHub Release with changelog notes.
 
 .DESCRIPTION
   Intended for a scheduled GitHub Actions workflow but works locally too (requires `gh` CLI).
 
-  "New version" identity = DLSS manifest version + Streamline dlss_override version,
-  encoded in the release tag:  v<dlss>-sl<sl>   e.g.  v310.9.0-sl2.14.0
+  "New version" identity = exported DLSS version + Streamline version (real DLL FileVersions),
+  encoded in the release tag:  v<dlss>-sl<sl>   e.g.  v310.9.1-sl2.14.1
   If the candidate is not strictly newer than every existing release, the script exits 0 without
-  touching anything (an older channel state can never pull "Latest release" backwards).
+  touching anything (a stale feed can never pull "Latest release" backwards).
 
   Changelog in the release notes contains:
-    - version deltas vs the previous release (DLSS + Streamline + GitHub SDK lag)
+    - per-component source table (which feed each component came from) + all feeds compared
     - per-file change list (added / changed / unchanged) computed from SHA-256 of the previous
       release's checksums.txt asset
     - the full checksum table
@@ -25,7 +26,7 @@
 [CmdletBinding()]
 param(
     [string]$Repo = '',
-    [ValidateSet('Newest', 'Staging', 'Production')]
+    [ValidateSet('Newest', 'Sdk', 'Staging', 'Production')]
     [string]$Channel = 'Newest'
 )
 
@@ -37,13 +38,6 @@ $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $exportScript = Join-Path $repoRoot 'Export-RtxOtaPreRelease.ps1'
 
 # ---------------------------------------------------------------- helpers
-function Get-DllShortVersion([string]$Path) {
-    # FileVersion "310,9,0,0" -> "310.9.0"
-    $v = (Get-Item $Path).VersionInfo.FileVersion -replace '[^0-9]', '.'
-    $p = $v.Split('.') | Where-Object { $_ -ne '' }
-    return ('{0}.{1}.{2}' -f $p[0], $p[1], $p[2])
-}
-
 function Resolve-7z {
     $candidates = @(
         (Get-Command 7z -ErrorAction SilentlyContinue),
@@ -61,27 +55,39 @@ function Resolve-7z {
 }
 
 function Get-PreviousChecksums([string]$RepoFull, [string]$PrevTag) {
+    # PS 5.1 mangles embedded double quotes in native args, so the name filter happens in
+    # PowerShell instead of inside a --jq expression.
     try {
-        $assets = gh api "repos/$RepoFull/releases/tags/$PrevTag" --jq '.assets[] | select(.name == "checksums.txt") | .url' 2>$null
-        if (-not $assets) { return $null }
+        $rel = gh api "repos/$RepoFull/releases/tags/$PrevTag" 2>$null | ConvertFrom-Json
+        $asset = @($rel.assets) | Where-Object { $_.name -eq 'checksums.txt' } | Select-Object -First 1
+        if (-not $asset) { return $null }
         $tmp = Join-Path $env:TEMP 'prev-checksums.txt'
-        gh api -H 'Accept: application/octet-stream' "repos/$RepoFull/releases/assets/$($assets | Select-Object -First 1 | ForEach-Object { ($_ -split '/')[-1] })" > $tmp 2>$null
+        gh api -H 'Accept: application/octet-stream' "repos/$RepoFull/releases/assets/$($asset.id)" > $tmp 2>$null
         if ((Get-Item $tmp).Length -gt 0) { return (Get-Content $tmp) }
     } catch { }
     return $null
 }
 
-# ---------------------------------------------------------------- 1. export current OTA state
-Write-Host '==> Exporting current OTA state' -ForegroundColor Cyan
+# ---------------------------------------------------------------- 1. export current state (multi-source)
+Write-Host '==> Exporting current newest state' -ForegroundColor Cyan
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("nvngx-release-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
-powershell -NoProfile -ExecutionPolicy Bypass -File $exportScript -OutDir $work -Channel $Channel -SkipGitHubCheck
+powershell -NoProfile -ExecutionPolicy Bypass -File $exportScript -OutDir $work -Channel $Channel
 if ($LASTEXITCODE -ne 0) { throw 'Export step failed.' }
-$channelFile = Join-Path $work 'export-channel.txt'
-$exportChannel = if (Test-Path $channelFile) { (Get-Content $channelFile -Raw).Trim() } else { $Channel }
+$sourcesFile = Join-Path $work 'export-sources.txt'
+$dlssSource = 'unknown'; $slSource = 'unknown'; $feedState = @{}
+if (Test-Path $sourcesFile) {
+    foreach ($line in (Get-Content $sourcesFile)) {
+        $p = $line -split '=', 3
+        if ($p.Count -lt 2) { continue }
+        if ($p[0] -eq 'dlss') { $dlssSource = $p[2] }
+        elseif ($p[0] -eq 'sl') { $slSource = $p[2] }
+        else { $feedState[$p[0]] = $p[1] }
+    }
+}
 
 $dlls = Get-ChildItem $work -Filter '*.dll'
-$dlssVer = Get-DllShortVersion (Join-Path $work 'nvngx_dlss.dll')
-$slVer   = Get-DllShortVersion (Join-Path $work 'sl.common.dll')
+$dlssVer = ConvertTo-ShortVersion (Get-Item (Join-Path $work 'nvngx_dlss.dll')).VersionInfo.FileVersion
+$slVer   = ConvertTo-ShortVersion (Get-Item (Join-Path $work 'sl.common.dll')).VersionInfo.FileVersion
 $tag = "v$dlssVer-sl$slVer"
 Write-Host "    DLSS $dlssVer / Streamline $slVer -> tag $tag"
 
@@ -108,7 +114,7 @@ if ($LASTEXITCODE -ne 0) { throw '7z packing failed.' }
 
 # checksums file (machine-readable, also used for next release's changelog diff)
 $checksumLines = $dlls | Sort-Object Name | ForEach-Object {
-    $short = Get-DllShortVersion $_.FullName
+    $short = ConvertTo-ShortVersion $_.VersionInfo.FileVersion
     $hash = Get-FileSha256 $_.FullName
     "$($_.Name)`t$short`t$hash"
 }
@@ -136,18 +142,24 @@ foreach ($line in $checksumLines) {
 $ghDlss = try { (Invoke-RestMethod 'https://api.github.com/repos/NVIDIA/DLSS/releases/latest' -TimeoutSec 20).tag_name } catch { 'unavailable' }
 $ghSl   = try { (Invoke-RestMethod 'https://api.github.com/repos/NVIDIA-RTX/Streamline/releases/latest' -TimeoutSec 20).tag_name } catch { 'unavailable' }
 
-$channelRoot = if ($exportChannel -eq 'Staging') { 'dev-models' } else { '3e933c08-ea30-45ae-93d1-5114edf9c3b9' }
 $notes = @"
-# NVIDIA RTX OTA $exportChannel $tag
+# NVIDIA RTX OTA $tag
 
-Exported from NVIDIA's NGX OTA **$exportChannel** channel (``$channelRoot``). Every file is
-SHA-256-verified against NVIDIA's published sidecar and Authenticode-signed by
-**NVIDIA Corporation**.
+Exported from the **newest available feed** - per-component winner across NGX OTA
+staging/production and the official Streamline SDK releases
+([NVIDIA-RTX/Streamline](https://github.com/NVIDIA-RTX/Streamline)). Every file is
+Authenticode-signed by **NVIDIA Corporation**; OTA payloads are also SHA-256-verified
+against NVIDIA's published sidecars.
 
-| Component | This release | Public SDK (GitHub) |
+| Component | This release | Source |
 |---|---|---|
-| DLSS (SR / RR / FG) | **$dlssVer** | $ghDlss |
-| Streamline plugins | **$slVer** | $ghSl |
+| DLSS (SR / RR / FG) | **$dlssVer** | $dlssSource |
+| Streamline plugins | **$slVer** | $slSource |
+
+Feeds compared: staging ``$(if ($feedState['staging']) { $feedState['staging'] } else { 'n/a' })`` |
+production ``$(if ($feedState['production']) { $feedState['production'] } else { 'n/a' })`` |
+Streamline SDK ``$(if ($feedState['sdk']) { $feedState['sdk'] } else { 'n/a' })``
+Public SDK (reference): DLSS $ghDlss, Streamline $ghSl
 
 ## Changelog
 
@@ -171,9 +183,8 @@ $notes += @"
 - ``nvngx_dlss.dll`` -> DLSS Super Resolution, ``nvngx_dlssd.dll`` -> Ray Reconstruction,
   ``nvngx_dlssg.dll`` -> Frame Generation, ``sl.*.dll`` -> Streamline runtime (games using SL).
 - Drop next to the game exe (or via DLSS Swapper / NGX override). Flat layout, no subfolders.
-$(if ($exportChannel -eq 'Staging') { '- Staging builds are NVIDIA-signed pre-releases: the driver only serves them when an override points at them.' } else { '- Production channel: what the driver serves a normal machine (no override needed).' })
 
-> Binaries are NVIDIA-copyrighted, fetched from NVIDIA's own CDN for personal use.
+> Binaries are NVIDIA-copyrighted, fetched from NVIDIA's own CDN / official SDK releases for personal use.
 "@
 $notesPath = Join-Path $work 'release-notes.md'
 $notes | Set-Content $notesPath -Encoding UTF8
@@ -182,7 +193,7 @@ $notes | Set-Content $notesPath -Encoding UTF8
 Write-Host "==> Creating GitHub release $tag" -ForegroundColor Cyan
 gh release create $tag $assetPath $checksumsPath `
     --repo $Repo `
-    --title "NVIDIA RTX OTA $exportChannel $tag" `
+    --title "NVIDIA RTX OTA $tag" `
     --notes-file $notesPath
 if ($LASTEXITCODE -ne 0) { throw 'gh release create failed.' }
 

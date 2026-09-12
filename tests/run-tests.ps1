@@ -78,12 +78,6 @@ try {
 Assert-True 'sha256: empty file -> known vector' ($h1 -eq 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
 Assert-True 'sha256: abc -> known vector' ($h2 -eq 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
 
-# ---------------------------------------------------------------- newest-channel resolution
-Assert-True 'resolve: production newer -> Production' ((Resolve-NewestChannel $staging3109 $production31010) -eq 'Production')
-Assert-True 'resolve: staging newer -> Staging' ((Resolve-NewestChannel $staging3109 $production3107) -eq 'Staging')
-Assert-True 'resolve: equal -> Staging (default)' ((Resolve-NewestChannel $staging3109 ($staging3109 -replace 'x', 'x')) -eq 'Staging')
-Assert-True 'resolve: production manifest missing -> Staging' ((Resolve-NewestChannel $staging3109 $null) -eq 'Staging')
-Assert-True 'resolve: staging manifest missing -> Production' ((Resolve-NewestChannel $null $production3107) -eq 'Production')
 
 # ---------------------------------------------------------------- tag identity + release gate
 $tag = Get-ReleaseTagVersion 'v310.9.0-sl2.14.0'
@@ -102,6 +96,37 @@ Assert-True 'gate: numeric 310.10.0 > 310.9.0 -> publish' (Test-ReleaseTagNewer 
 Assert-True 'gate: dlss equal, sl newer -> publish' (Test-ReleaseTagNewer '310.9.0' '2.15.0' 'v310.9.0-sl2.14.0')
 Assert-True 'gate: dlss equal, sl older -> skip' (-not (Test-ReleaseTagNewer '310.9.0' '2.13.0' 'v310.9.0-sl2.14.0'))
 Assert-True 'gate: unparseable existing tag does not block' (Test-ReleaseTagNewer '310.9.0' '2.14.0' 'some-other-tag')
+
+# ---------------------------------------------------------------- multi-source winners
+$win = Select-ComponentWinners @(
+    @{ Source = 'ota-staging';    Dlss = '310.9.0';   Sl = '2.14.0' },
+    @{ Source = 'ota-production'; Dlss = '310.7.128'; Sl = '2.12.128' },
+    @{ Source = 'sdk-streamline'; Dlss = '310.9.1';   Sl = '2.14.1' }
+)
+Assert-True 'short version: comma-separated FileVersion' ((ConvertTo-ShortVersion '310,9,1,0') -eq '310.9.1')
+Assert-True 'short version: dot-separated FileVersion' ((ConvertTo-ShortVersion '2.14.1.0') -eq '2.14.1')
+Assert-True 'short version: regression - must not merge digits (old bug: 310910..)' ((ConvertTo-ShortVersion '310,9,0,0') -eq '310.9.0')
+$hEmpty = try { ConvertTo-ShortVersion '' } catch { '<threw>' }
+Assert-True 'short version: empty FileVersion -> empty string (versionless DLLs)' ($hEmpty -eq '')
+Assert-True 'winners: SDK newest on both components' ($win.DlssSource -eq 'sdk-streamline' -and $win.DlssVersion -eq '310.9.1' -and $win.SlSource -eq 'sdk-streamline' -and $win.SlVersion -eq '2.14.1')
+
+$win2 = Select-ComponentWinners @(
+    @{ Source = 'ota-staging';    Dlss = '310.10.0'; Sl = '2.14.0' },
+    @{ Source = 'sdk-streamline'; Dlss = '310.9.1';  Sl = '2.14.1' }
+)
+Assert-True 'winners: mixed - DLSS from OTA (numeric 310.10 > 310.9), SL from SDK' ($win2.DlssSource -eq 'ota-staging' -and $win2.DlssVersion -eq '310.10.0' -and $win2.SlSource -eq 'sdk-streamline')
+
+$win3 = Select-ComponentWinners @(
+    @{ Source = 'ota-staging';    Dlss = '310.9.1'; Sl = '2.14.1' },
+    @{ Source = 'sdk-streamline'; Dlss = '310.9.1'; Sl = '2.14.1' }
+)
+Assert-True 'winners: tie -> SDK preferred (official SDK repo first)' ($win3.DlssSource -eq 'sdk-streamline' -and $win3.SlSource -eq 'sdk-streamline')
+
+$win4 = Select-ComponentWinners @(@{ Source = 'ota-production'; Dlss = '310.8.0'; Sl = '2.13.0' })
+Assert-True 'winners: single source -> that source' ($win4.DlssSource -eq 'ota-production' -and $win4.SlVersion -eq '2.13.0')
+
+Assert-True 'sdk asset: x64 zip preferred over arch variants' ((Get-SdkZipAssetName @('streamline-sdk-v2.14.1-aarch64.zip', 'streamline-sdk-v2.14.1.zip', 'streamline-sdk-v2.14.1-arm64ec.zip')) -eq 'streamline-sdk-v2.14.1.zip')
+Assert-True 'sdk asset: fallback to any zip' ((Get-SdkZipAssetName @('streamline-2.14.1.zip')) -eq 'streamline-2.14.1.zip')
 
 # ---------------------------------------------------------------- summary
 if ($script:failed -gt 0) {
