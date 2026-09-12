@@ -137,7 +137,8 @@ try {
     Assert-True 'cache: hit under second root when first misses' ((Find-OtaCachedPayload @("$cacheRoot1-missing", $cacheRoot2) 'dlssd' '20318464' '160_E658700.bin') -eq $cacheRel2)
     Assert-True 'cache: wrong packed version -> miss' ($null -eq (Find-OtaCachedPayload @($cacheRoot1) 'dlss' '20318080' '160_E658700.bin'))
     Assert-True 'cache: wrong payload file -> miss' ($null -eq (Find-OtaCachedPayload @($cacheRoot1) 'dlss' '20318464' '160_E658701.bin'))
-    Assert-True 'cache: no roots exist -> null' ($null -eq (Find-OtaCachedPayload @('L:\definitely-not-a-real-root') 'dlss' '20318464' '160_E658700.bin'))
+    $missingRoot = Join-Path ([System.IO.Path]::GetTempPath()) 'ota-cache-missing-root-does-not-exist'
+    Assert-True 'cache: no roots exist -> null' ($null -eq (Find-OtaCachedPayload @($missingRoot) 'dlss' '20318464' '160_E658700.bin'))
 } finally {
     Remove-Item $cacheRoot1, $cacheRoot2 -Recurse -Force -ErrorAction SilentlyContinue
 }
