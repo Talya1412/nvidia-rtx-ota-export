@@ -174,6 +174,14 @@ if (-not $prevTag) {
     if ($removed.Count)  { $notes += ($removed  | ForEach-Object { "- **removed**: ``$_``" }) + "`n" }
     if (-not $changed.Count -and -not $added.Count -and -not $removed.Count) { $notes += "- No file content changed (version bump only).`n" }
 }
+# DLSS 5 Neural Rendering (dlssnr) section when the export produced one
+$snrAssets = @(Get-ChildItem $work -Filter 'nvngx_dlssnr_*.zip' -ErrorAction SilentlyContinue)
+if ($snrAssets.Count -gt 0) {
+    $snrNotePath = Join-Path $work 'dlssnr-notes.txt'
+    if (Test-Path $snrNotePath) {
+        $notes += "`n## DLSS 5 Neural Rendering (dlssnr)`n`n" + ((Get-Content $snrNotePath -Raw) -replace "`r`n", "`n")
+    }
+}
 $fence = '```'
 $notes += "`n## Checksums`n`n$fence`n" + ($checksumLines -join "`n") + "`n$fence"
 $notes += @"
@@ -191,7 +199,7 @@ $notes | Set-Content $notesPath -Encoding UTF8
 
 # ---------------------------------------------------------------- 5. publish
 Write-Host "==> Creating GitHub release $tag" -ForegroundColor Cyan
-gh release create $tag $assetPath $checksumsPath `
+gh release create $tag $assetPath $checksumsPath $snrAssets `
     --repo $Repo `
     --title "NVIDIA RTX OTA $tag" `
     --notes-file $notesPath

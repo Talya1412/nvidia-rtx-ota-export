@@ -65,6 +65,18 @@ $ChannelRoots = @{
 $ManifestPath = 'config/versions/2/files/nvngx_server_config.txt'
 $SignerPattern = 'NVIDIA Corporation'
 $GenericPayload = '160_E658700'
+function Get-GitHubJson([string]$ApiPath) {
+    # gh CLI (authenticated, 5000/h) when available; plain unauth REST (60/h per IP) otherwise.
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    if ($gh) {
+        try {
+            $json = gh api $ApiPath 2>$null
+            if ($LASTEXITCODE -eq 0 -and $json) { return ($json | ConvertFrom-Json) }
+        } catch { }
+    }
+    return Invoke-RestMethod -Uri "https://api.github.com/$ApiPath" -TimeoutSec 30
+}
+
 function Get-ChannelBaseUrl([string]$Ch) {
     "https://ngx.download.nvidia.com/$($ChannelRoots[$Ch])/org/nvidia/team/ngx/models"
 }
@@ -159,7 +171,7 @@ function Get-OtaChannelState([string]$Ch) {
 
 function Expand-ZipSubset([string]$ZipPath, [string]$EntryPrefix, [string]$DestDir) {
     New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
-    $prefix = $EntryPrefix.Trim('/') + '/'
+    $prefix = if ($EntryPrefix) { $EntryPrefix.Trim('/') + '/' } else { '' }
     $z = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
     try {
         foreach ($e in $z.Entries) {
@@ -180,7 +192,7 @@ $sdk = $null
 if ($wantSdk) {
     Write-Step 'Fetching latest Streamline SDK release (GitHub)'
     try {
-        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/NVIDIA-RTX/Streamline/releases/latest' -TimeoutSec 30
+        $rel = Get-GitHubJson 'repos/NVIDIA-RTX/Streamline/releases/latest'
         $zipName = Get-SdkZipAssetName (@($rel.assets) | ForEach-Object { $_.name })
         if (-not $zipName) { throw 'latest release has no zip asset' }
         $asset = @($rel.assets) | Where-Object { $_.name -eq $zipName } | Select-Object -First 1
@@ -311,6 +323,71 @@ foreach ($ch in 'Staging', 'Production') {
     }
 }
 if ($sdk -and (Test-Path $sdk.Dir)) { Remove-Item $sdk.Dir -Recurse -Force }
+
+# ---------------------------------------------------------------- dlssnr mirror (DLSS 5 neural rendering)
+# NVIDIA's OTA channel and SDK repos do not ship nvngx_dlssnr.dll; the community mirror
+# RankFTW/rhi-repo re-posts NVIDIA builds (some repacked per GPU generation). Only builds that
+# pass the SAME Authenticode gate are eligible - a repacked build (HashMismatch) or an unsigned
+# one is rejected. dlssnr is a per-GPU artifact: it ships as its own zip, never inside the
+# main DLL set. Candidates are tried newest-first, capped at 2 downloads per run.
+$dlssnrNote = ''
+if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
+    Write-Step 'Checking dlssnr mirror (DLSS 5 neural rendering, NVIDIA-signed builds only)'
+    try {
+        $snrRels = Get-GitHubJson 'repos/RankFTW/rhi-repo/releases?per_page=100'
+        $snrCands = @()
+        foreach ($r in @($snrRels)) {
+            if ($r.tag_name -notmatch '^dlssnr-(.+)$') { continue }
+            $snrVer = $Matches[1]
+            try { $null = [version]($snrVer -replace '-[A-Za-z0-9.]+$', '') } catch { continue }
+            $snrAsset = @($r.assets) | Where-Object { $_.name -eq "nvngx_dlssnr_$snrVer.zip" } | Select-Object -First 1
+            if ($snrAsset) { $snrCands += @{ Tag = $r.tag_name; Version = $snrVer; Asset = $snrAsset } }
+        }
+        $snrOrder = @($snrCands | Sort-Object -Property @{ Expression = { [version]($_.Version -replace '-[A-Za-z0-9.]+$', '') }; Descending = $true })
+        $snrChecked = @()
+        foreach ($cand in $snrOrder) {
+            $snrZip = Join-Path $env:TEMP "dlssnr-$($cand.Version).zip"
+            $snrDir = Join-Path $env:TEMP "dlssnr-$($cand.Version)"
+            try {
+                Invoke-WebRequest -Uri $cand.Asset.browser_download_url -OutFile $snrZip -UseBasicParsing
+                Expand-ZipSubset $snrZip '' $snrDir
+                $snrDll = Join-Path $snrDir 'nvngx_dlssnr.dll'
+                $verOk = ConvertTo-ShortVersion (Get-Item $snrDll).VersionInfo.FileVersion
+                $snrPassed = Test-VerifiedNvidiaDll $snrDll
+                $snrChecked += @{ Tag = $cand.Tag; Version = $verOk; Pass = $snrPassed }
+                if ($snrPassed) {
+                    $assetZip = Join-Path $OutDir "nvngx_dlssnr_$($cand.Version).zip"
+                    $snrStage = Join-Path $env:TEMP "dlssnr-stage-$($cand.Version)"
+                    if (Test-Path $snrStage) { Remove-Item $snrStage -Recurse -Force }
+                    New-Item -ItemType Directory -Path $snrStage -Force | Out-Null
+                    Copy-Item $snrDll (Join-Path $snrStage 'nvngx_dlssnr.dll') -Force
+                    [System.IO.Compression.ZipFile]::CreateFromDirectory($snrStage, $assetZip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+                    Remove-Item $snrStage -Recurse -Force
+                    $dlssnrNote += "- ``nvngx_dlssnr_$($cand.Version).zip`` (from ``RankFTW/rhi-repo`` tag ``$($cand.Tag)``): Authenticode **Valid (NVIDIA Corporation)**.`n"
+                    break
+                } else {
+                    Write-Warn2 "dlssnr $($cand.Version) ($($cand.Tag)): signature FAILED - rejected."
+                    $dlssnrNote += "- ``$($cand.Tag)``: signature FAILED (modified or unsigned build) - rejected by the Authenticode gate.`n"
+                }
+            } catch {
+                Write-Warn2 "dlssnr candidate $($cand.Tag) failed: $($_.Exception.Message)"
+                $dlssnrNote += "- ``$($cand.Tag)``: fetch failed ($($_.Exception.Message)).`n"
+            } finally {
+                if (Test-Path $snrZip) { Remove-Item $snrZip -Force }
+                if (Test-Path $snrDir) { Remove-Item $snrDir -Recurse -Force }
+            }
+        }
+        $snrBest = Select-DlssnrBuild $snrChecked
+        if (-not $snrBest) { Write-Info 'No NVIDIA-signed dlssnr build available - skipped.' }
+    } catch {
+        Write-Warn2 "dlssnr mirror unreachable: $($_.Exception.Message) - skipped."
+    }
+}
+if ($dlssnrNote) {
+    $dlssnrNotePath = Join-Path $OutDir 'dlssnr-notes.txt'
+    $dlssnrHeader = "DLSS 5 Neural Rendering (nvngx_dlssnr.dll) - per-GPU artifact, shipped separately from the main DLL set.`nSource: RankFTW/rhi-repo (NVIDIA-signed builds only; every file re-verified against NVIDIA's Authenticode signature).`n`n"
+    Set-Content -Path $dlssnrNotePath -Value ($dlssnrHeader + $dlssnrNote) -Encoding UTF8
+}
 
 Write-Step 'Authenticode + PE verification of exported files'
 $report = @()
