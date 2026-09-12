@@ -20,13 +20,6 @@ function ConvertTo-PackedVersion([string]$Version) {
 # Digits only; non-digits become separators (the old comma-DELETING variant merged "310,9,1,0"
 # into "310910" and silently broke every version comparison).
 function ConvertTo-ShortVersion([string]$FileVersion) {
-    $p = ($FileVersion -replace '[^0-9]', '.').Split('.') | Where-Object { $_ -ne '' }
-    return ('{0}.{1}.{2}' -f $p[0], $p[1], $p[2])
-}
-
-# Lowercase hex SHA-256 via the .NET API - deliberately NOT the Get-FileHash cmdlet, which
-# disappears on hosts where PowerShell module autoloading is broken (observed on real machines).
-function ConvertTo-ShortVersion([string]$FileVersion) {
     $p = @(($FileVersion -replace '[^0-9]', '.').Split('.') | Where-Object { $_ })
     if ($p.Count -eq 0) { return '' }
     $maj = $p[0]; $min = if ($p.Count -gt 1) { $p[1] } else { '0' }; $pat = if ($p.Count -gt 2) { $p[2] } else { '0' }
