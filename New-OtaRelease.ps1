@@ -1,14 +1,16 @@
 <#
 .SYNOPSIS
-  Check NVIDIA OTA for a new pre-release version; only when newer than the last GitHub release,
-  export the DLLs, package a 7z (flat layout) and publish a GitHub Release with changelog notes.
+  Check NVIDIA OTA for a new version (newest of the staging/production channels by default);
+  only when strictly newer than every existing GitHub release, export the DLLs, package a 7z
+  (flat layout) and publish a GitHub Release with changelog notes.
 
 .DESCRIPTION
   Intended for a scheduled GitHub Actions workflow but works locally too (requires `gh` CLI).
 
   "New version" identity = DLSS manifest version + Streamline dlss_override version,
   encoded in the release tag:  v<dlss>-sl<sl>   e.g.  v310.9.0-sl2.14.0
-  If a release with that tag already exists, the script exits 0 without touching anything.
+  If the candidate is not strictly newer than every existing release, the script exits 0 without
+  touching anything (an older channel state can never pull "Latest release" backwards).
 
   Changelog in the release notes contains:
     - version deltas vs the previous release (DLSS + Streamline + GitHub SDK lag)
@@ -23,12 +25,13 @@
 [CmdletBinding()]
 param(
     [string]$Repo = '',
-    [ValidateSet('Staging', 'Production')]
-    [string]$Channel = 'Staging'
+    [ValidateSet('Newest', 'Staging', 'Production')]
+    [string]$Channel = 'Newest'
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+Import-Module (Join-Path $PSScriptRoot 'Ota.Common.psm1') -Force
 
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $exportScript = Join-Path $repoRoot 'Export-RtxOtaPreRelease.ps1'
@@ -69,10 +72,12 @@ function Get-PreviousChecksums([string]$RepoFull, [string]$PrevTag) {
 }
 
 # ---------------------------------------------------------------- 1. export current OTA state
-Write-Host '==> Exporting current OTA pre-release state' -ForegroundColor Cyan
+Write-Host '==> Exporting current OTA state' -ForegroundColor Cyan
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("nvngx-release-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 powershell -NoProfile -ExecutionPolicy Bypass -File $exportScript -OutDir $work -Channel $Channel -SkipGitHubCheck
 if ($LASTEXITCODE -ne 0) { throw 'Export step failed.' }
+$channelFile = Join-Path $work 'export-channel.txt'
+$exportChannel = if (Test-Path $channelFile) { (Get-Content $channelFile -Raw).Trim() } else { $Channel }
 
 $dlls = Get-ChildItem $work -Filter '*.dll'
 $dlssVer = Get-DllShortVersion (Join-Path $work 'nvngx_dlss.dll')
@@ -85,9 +90,10 @@ if (-not $Repo) {
     $remote = git -C $repoRoot remote get-url origin
     $Repo = ($remote -replace '.*github\.com[:/]', '' -replace '\.git$', '')
 }
-$existing = gh api "repos/$Repo/releases?per_page=100" --jq '.[].tag_name' 2>$null
-if ($existing -contains $tag) {
-    Write-Host "==> No new OTA version (release $tag already exists). Nothing to do." -ForegroundColor Green
+$existing = gh api --paginate "repos/$Repo/releases?per_page=100" --jq '.[].tag_name' 2>$null
+$maxTag = Get-NewestReleaseTag @($existing)
+if ($maxTag -and -not (Test-ReleaseTagNewer $dlssVer $slVer $maxTag)) {
+    Write-Host "==> Candidate $tag is not newer than the newest existing release $maxTag. Nothing to do." -ForegroundColor Green
     Remove-Item $work -Recurse -Force
     exit 0
 }
@@ -103,14 +109,14 @@ if ($LASTEXITCODE -ne 0) { throw '7z packing failed.' }
 # checksums file (machine-readable, also used for next release's changelog diff)
 $checksumLines = $dlls | Sort-Object Name | ForEach-Object {
     $short = Get-DllShortVersion $_.FullName
-    $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    $hash = Get-FileSha256 $_.FullName
     "$($_.Name)`t$short`t$hash"
 }
 $checksumsPath = Join-Path $work 'checksums.txt'
 $checksumLines | Set-Content $checksumsPath -Encoding UTF8
 
 # ---------------------------------------------------------------- 4. changelog vs previous release
-$prevTag = $existing | Select-Object -First 1
+$prevTag = $maxTag
 $prevSums = if ($prevTag) { Get-PreviousChecksums $Repo $prevTag } else { $null }
 $changed = @(); $added = @(); $unchanged = @()
 $prevMap = @{}
@@ -130,12 +136,13 @@ foreach ($line in $checksumLines) {
 $ghDlss = try { (Invoke-RestMethod 'https://api.github.com/repos/NVIDIA/DLSS/releases/latest' -TimeoutSec 20).tag_name } catch { 'unavailable' }
 $ghSl   = try { (Invoke-RestMethod 'https://api.github.com/repos/NVIDIA-RTX/Streamline/releases/latest' -TimeoutSec 20).tag_name } catch { 'unavailable' }
 
+$channelRoot = if ($exportChannel -eq 'Staging') { 'dev-models' } else { '3e933c08-ea30-45ae-93d1-5114edf9c3b9' }
 $notes = @"
-# NVIDIA RTX OTA Pre-Release $tag
+# NVIDIA RTX OTA $exportChannel $tag
 
-Exported from NVIDIA's NGX OTA **$Channel** channel (``dev-models``) — the feed that runs ahead of
-public SDK releases. Every file is SHA-256-verified against NVIDIA's published sidecar and
-Authenticode-signed by **NVIDIA Corporation**.
+Exported from NVIDIA's NGX OTA **$exportChannel** channel (``$channelRoot``). Every file is
+SHA-256-verified against NVIDIA's published sidecar and Authenticode-signed by
+**NVIDIA Corporation**.
 
 | Component | This release | Public SDK (GitHub) |
 |---|---|---|
@@ -164,7 +171,7 @@ $notes += @"
 - ``nvngx_dlss.dll`` -> DLSS Super Resolution, ``nvngx_dlssd.dll`` -> Ray Reconstruction,
   ``nvngx_dlssg.dll`` -> Frame Generation, ``sl.*.dll`` -> Streamline runtime (games using SL).
 - Drop next to the game exe (or via DLSS Swapper / NGX override). Flat layout, no subfolders.
-- Staging builds are NVIDIA-signed pre-releases: the driver only serves them when an override points at them.
+$(if ($exportChannel -eq 'Staging') { '- Staging builds are NVIDIA-signed pre-releases: the driver only serves them when an override points at them.' } else { '- Production channel: what the driver serves a normal machine (no override needed).' })
 
 > Binaries are NVIDIA-copyrighted, fetched from NVIDIA's own CDN for personal use.
 "@
@@ -175,7 +182,7 @@ $notes | Set-Content $notesPath -Encoding UTF8
 Write-Host "==> Creating GitHub release $tag" -ForegroundColor Cyan
 gh release create $tag $assetPath $checksumsPath `
     --repo $Repo `
-    --title "NVIDIA RTX OTA Pre-Release $tag" `
+    --title "NVIDIA RTX OTA $exportChannel $tag" `
     --notes-file $notesPath
 if ($LASTEXITCODE -ne 0) { throw 'gh release create failed.' }
 

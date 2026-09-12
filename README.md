@@ -12,7 +12,7 @@ public SDK release.
 One command (or double-click `run-export.bat`) produces a verified folder of drop-in DLLs:
 
 ```
-nvngx_dlss.dll      DLSS Super Resolution   (staging build, e.g. 310.9.0)
+nvngx_dlss.dll      DLSS Super Resolution   (newest OTA build, e.g. 310.9.0)
 nvngx_dlssd.dll     DLSS Ray Reconstruction
 nvngx_dlssg.dll     DLSS Frame Generation
 sl.common.dll       Streamline 2.x runtime plugins (9 files)
@@ -26,13 +26,15 @@ export-summary.txt  per-file version + SHA-256
 ## Automated releases
 
 `.github/workflows/ota-release.yml` runs **weekly** (Monday 09:00 UTC) and on demand via
-*Run workflow* (with a channel picker: Staging pre-release or Production).
+*Run workflow* (with a channel picker: **Newest** — the newer of the staging/production manifests, the default — or force Staging/Production).
 It calls `New-OtaRelease.ps1`, which:
 
-1. exports the current OTA state of the selected channel (the pipeline above),
+1. exports the current OTA state of the selected channel — in **Newest** mode it fetches both
+   manifests and exports from whichever channel is newer (production is not always behind staging),
 2. builds the release tag `v<dlss>-sl<streamline>` (e.g. `v310.9.0-sl2.14.0`),
-3. **exits without publishing** if a release with that tag already exists — so a release only
-   appears when NVIDIA ships a new OTA version,
+3. **exits without publishing** unless the candidate is strictly newer than every existing release —
+   so a release only appears when NVIDIA ships a new OTA version, and a stale channel can never
+   pull "Latest release" backwards,
 4. otherwise packs the DLLs into a flat **7z** (same drop-in layout as a game folder), attaches
    `checksums.txt`, and publishes release notes with a real changelog: version deltas, per-file
    added/changed/removed diff (by SHA-256 against the previous release's checksums), and the
@@ -47,10 +49,11 @@ Local run (uses your `gh` login):
 ## Usage
 
 ```powershell
-# default: staging (pre-release) channel, output to Downloads, plus a ZIP
+# default: newest channel (auto-picks staging or production, whichever is newer)
 powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Zip
 
-# production channel (what the driver serves a normal machine)
+# force one channel: staging (pre-release) or production (what the driver serves normally)
+powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Channel Staging -Zip
 powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Channel Production -Zip
 
 # custom output dir
@@ -66,6 +69,7 @@ Or double-click `run-export.bat`.
    with channel `dev-models` = **staging / pre-release**, `3e933c08-ea30-45ae-93d1-5114edf9c3b9` =
    **production** (same switch as NVIDIA's own Streamline OTA client: registry `NGXCore\CDNServerType`,
    `0 - production / 1 - staging`, see `sl.ota/ota.cpp` in the Streamline SDK).
+   In **Newest** mode (the default) both manifests are fetched and the newer channel wins.
 2. **Resolve versions** — reads `app_E658700` / `app_E658703` generic app pins for sections
    `dlss`, `dlssd`, `dlssg`, `dlss_override` (the Streamline bundle).
 3. **GitHub cross-check** — compares against the latest public `NVIDIA/DLSS` and

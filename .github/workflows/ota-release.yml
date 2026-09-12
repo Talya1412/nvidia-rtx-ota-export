@@ -9,10 +9,11 @@ on:
   workflow_dispatch:
     inputs:
       channel:
-        description: 'OTA channel to track'
+        description: 'OTA channel to track (Newest = newer of staging/production)'
         type: choice
-        default: Staging
+        default: Newest
         options:
+          - Newest
           - Staging
           - Production
 
@@ -25,9 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Unit tests (shared OTA logic)
+        shell: pwsh
+        run: ./tests/run-tests.ps1
+
       - name: Export + release on new OTA version
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: ./New-OtaRelease.ps1 -Channel '${{ github.event.inputs.channel || 'Staging' }}'
+        run: ./New-OtaRelease.ps1 -Channel '${{ github.event.inputs.channel || 'Newest' }}'

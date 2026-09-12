@@ -4,7 +4,8 @@
 
 .DESCRIPTION
   Pipeline (fully unattended):
-    1. Fetch NVIDIA NGX OTA manifest (staging "dev-models" = pre-release channel, or production).
+  1. Resolve the OTA channel: -Channel Newest (default) fetches BOTH manifests and exports from
+     whichever channel is newer; or force Staging / Production.
     2. Resolve latest versions of: dlss / dlssd / dlssg (DLSS runtime) and dlss_override
        (Streamline plugin bundle) on that channel.
     3. (Optional) Compare against latest public GitHub SDK releases (NVIDIA/DLSS, NVIDIA-RTX/Streamline).
@@ -28,7 +29,8 @@
   Also package OutDir into a single ZIP next to it.
 
 .PARAMETER Channel
-  Staging (default, pre-release — runs ahead of production) or Production (what the driver serves normally).
+  Newest (default) compares both channels and exports from the newer one; or force Staging
+  (pre-release — runs ahead of production) / Production (what the driver serves normally).
 
 .PARAMETER SkipGitHubCheck
   Skip the GitHub latest-release comparison (offline / rate-limit friendly).
@@ -40,22 +42,31 @@
 param(
     [string]$OutDir = '',
     [switch]$Zip,
-    [ValidateSet('Staging', 'Production')]
-    [string]$Channel = 'Staging',
+    [ValidateSet('Newest', 'Staging', 'Production')]
+    [string]$Channel = 'Newest',
     [switch]$SkipGitHubCheck
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+Import-Module (Join-Path $PSScriptRoot 'Ota.Common.psm1') -Force
+# Host robustness: where PSModulePath carries PowerShell 7 dirs, by-name autoloading of
+# Microsoft.PowerShell.Security can resolve to an incompatible copy and fail with
+# "type data ... already present" (breaks Get-AuthenticodeSignature). Load the matching copy
+# explicitly, by absolute path; fall back to by-name (pwsh / PowerShell 7 loads its own copy).
+$securityPsd1 = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+try { Import-Module $securityPsd1 -ErrorAction Stop } catch { Import-Module 'Microsoft.PowerShell.Security' -ErrorAction Stop }
 
 $ChannelRoots = @{
     Staging    = 'dev-models'
     Production = '3e933c08-ea30-45ae-93d1-5114edf9c3b9'
 }
-$BaseUrl = "https://ngx.download.nvidia.com/$($ChannelRoots[$Channel])/org/nvidia/team/ngx/models"
-$ManifestUrl = "$BaseUrl/config/versions/2/files/nvngx_server_config.txt"
+$ManifestPath = 'config/versions/2/files/nvngx_server_config.txt'
 $SignerPattern = 'NVIDIA Corporation'
 $GenericPayload = '160_E658700'
+function Get-ChannelBaseUrl([string]$Ch) {
+    "https://ngx.download.nvidia.com/$($ChannelRoots[$Ch])/org/nvidia/team/ngx/models"
+}
 
 if (-not $OutDir) {
     $downloads = Join-Path $env:USERPROFILE 'Downloads'
@@ -71,28 +82,6 @@ function Get-UrlText([string]$Url) {
     $r = Invoke-WebRequest -Uri $Url -UseBasicParsing
     if ($r.Content -is [byte[]]) { return [System.Text.Encoding]::UTF8.GetString($r.Content) }
     return [string]$r.Content
-}
-
-function Get-OtaManifest([string]$Url) {
-    Get-UrlText $Url
-}
-
-function Get-OtaSectionVersion([string]$Manifest, [string]$Section) {
-    $body = [regex]::Match($Manifest, "(?ms)^\[$([regex]::Escape($Section))\]\s*(.*?)(?=^\[|\z)")
-    if (-not $body.Success) { return $null }
-    $v = [regex]::Match($body.Groups[1].Value, 'app_E65870[03]\s*=\s*([0-9]+(?:\.[0-9]+)+)')
-    if ($v.Success) { return $v.Groups[1].Value }
-    return $null
-}
-
-function ConvertTo-PackedVersion([string]$Version) {
-    $p = $Version.Split('.')
-    $maj = [int]$p[0]; $min = if ($p.Length -gt 1) { [int]$p[1] } else { 0 }; $pat = if ($p.Length -gt 2) { [int]$p[2] } else { 0 }
-    return ($maj -shl 16) -bor ($min -shl 8) -bor $pat
-}
-
-function Get-FileSha256([string]$Path) {
-    (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
 function Test-SidecarSha256([string]$FilePath, [string]$SidecarUrl) {
@@ -140,11 +129,6 @@ function Get-FileMajorMinorPatch([string]$Path) {
     return ('{0}.{1}.{2}' -f $p[0], $p[1], $p[2])
 }
 
-function Compare-OtaNewer([string]$A, [string]$B) {
-    # true when $A is strictly newer than $B
-    try { return ([version]$A -gt [version]$B) } catch { return $false }
-}
-
 function Get-GitHubLatestTag([string]$Repo) {
     try {
         return (Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -TimeoutSec 20).tag_name
@@ -153,9 +137,20 @@ function Get-GitHubLatestTag([string]$Repo) {
     }
 }
 
-# ---------------------------------------------------------------- pipeline
+# ---------------------------------------------------------------- resolve channel + fetch manifest
+if ($Channel -eq 'Newest') {
+    Write-Step 'Resolving newest channel (staging vs production)'
+    $mStaging = $mProduction = $null
+    try { $mStaging = Get-UrlText "$(Get-ChannelBaseUrl 'Staging')/$ManifestPath" } catch { Write-Warn2 "Staging manifest unreachable: $($_.Exception.Message)" }
+    try { $mProduction = Get-UrlText "$(Get-ChannelBaseUrl 'Production')/$ManifestPath" } catch { Write-Warn2 "Production manifest unreachable: $($_.Exception.Message)" }
+    if (-not $mStaging -and -not $mProduction) { throw 'Neither OTA manifest is reachable - aborting.' }
+    $Channel = Resolve-NewestChannel $mStaging $mProduction
+    $manifest = if ($Channel -eq 'Staging') { $mStaging } else { $mProduction }
+} else {
+    $manifest = Get-UrlText "$(Get-ChannelBaseUrl $Channel)/$ManifestPath"
+}
+$BaseUrl = Get-ChannelBaseUrl $Channel
 Write-Step "Channel: $Channel ($($ChannelRoots[$Channel]))"
-$manifest = Get-OtaManifest $ManifestUrl
 $verDlss   = Get-OtaSectionVersion $manifest 'dlss'
 $verDlssd  = Get-OtaSectionVersion $manifest 'dlssd'
 $verDlssg  = Get-OtaSectionVersion $manifest 'dlssg'
@@ -192,6 +187,7 @@ Write-Info "Bundle verified: $(Get-FileSha256 $tmpZip)"
 Write-Step 'Extracting + verifying DLLs'
 if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+Set-Content -Path (Join-Path $OutDir 'export-channel.txt') -Value $Channel -Encoding Ascii
 $tmpExtract = Join-Path $env:TEMP "nvngx_ota_extract_$slPacked"
 if (Test-Path $tmpExtract) { Remove-Item $tmpExtract -Recurse -Force }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
