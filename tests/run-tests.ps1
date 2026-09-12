@@ -122,6 +122,25 @@ $win3 = Select-ComponentWinners @(
 )
 Assert-True 'winners: tie -> SDK preferred (official SDK repo first)' ($win3.DlssSource -eq 'sdk-streamline' -and $win3.SlSource -eq 'sdk-streamline')
 
+
+# ---------------------------------------------------------------- driver OTA cache lookup
+$cacheRoot1 = Join-Path ([System.IO.Path]::GetTempPath()) ('ota-cache-' + [guid]::NewGuid().ToString('N'))
+$cacheRel = Join-Path $cacheRoot1 'models\dlss\versions\20318464\files\160_E658700.bin'
+New-Item -ItemType Directory -Path (Split-Path $cacheRel -Parent) -Force | Out-Null
+Set-Content -Path $cacheRel -Value 'payload-bytes'
+$cacheRoot2 = Join-Path ([System.IO.Path]::GetTempPath()) ('ota-cache-' + [guid]::NewGuid().ToString('N'))
+$cacheRel2 = Join-Path $cacheRoot2 'models\dlssd\versions\20318464\files\160_E658700.bin'
+New-Item -ItemType Directory -Path (Split-Path $cacheRel2 -Parent) -Force | Out-Null
+Set-Content -Path $cacheRel2 -Value 'payload-bytes-2'
+try {
+    Assert-True 'cache: hit under first root' ((Find-OtaCachedPayload @($cacheRoot1) 'dlss' '20318464' '160_E658700.bin') -eq $cacheRel)
+    Assert-True 'cache: hit under second root when first misses' ((Find-OtaCachedPayload @("$cacheRoot1-missing", $cacheRoot2) 'dlssd' '20318464' '160_E658700.bin') -eq $cacheRel2)
+    Assert-True 'cache: wrong packed version -> miss' ($null -eq (Find-OtaCachedPayload @($cacheRoot1) 'dlss' '20318080' '160_E658700.bin'))
+    Assert-True 'cache: wrong payload file -> miss' ($null -eq (Find-OtaCachedPayload @($cacheRoot1) 'dlss' '20318464' '160_E658701.bin'))
+    Assert-True 'cache: no roots exist -> null' ($null -eq (Find-OtaCachedPayload @('L:\definitely-not-a-real-root') 'dlss' '20318464' '160_E658700.bin'))
+} finally {
+    Remove-Item $cacheRoot1, $cacheRoot2 -Recurse -Force -ErrorAction SilentlyContinue
+}
 $win4 = Select-ComponentWinners @(@{ Source = 'ota-production'; Dlss = '310.8.0'; Sl = '2.13.0' })
 Assert-True 'winners: single source -> that source' ($win4.DlssSource -eq 'ota-production' -and $win4.SlVersion -eq '2.13.0')
 

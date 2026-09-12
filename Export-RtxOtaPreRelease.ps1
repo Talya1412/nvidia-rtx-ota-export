@@ -69,6 +69,15 @@ function Get-ChannelBaseUrl([string]$Ch) {
     "https://ngx.download.nvidia.com/$($ChannelRoots[$Ch])/org/nvidia/team/ngx/models"
 }
 
+# Driver's local OTA cache (populated by NVIDIA's own updater, nvngx_update.exe). Probed
+# read-only: registry-declared NGXPath (newer drivers) first, then the two default locations.
+$OtaCacheRoots = @(
+    ((Get-ItemProperty 'HKLM:\SOFTWARE\NVIDIA Corporation\Global\NGXCore' -ErrorAction SilentlyContinue).NGXPath),
+    (Join-Path $env:ProgramData 'NVIDIA\NGX'),
+    (Join-Path $env:APPDATA 'NVIDIA\NGX')
+) | Where-Object { $_ }
+$OtaCacheRoots = @($OtaCacheRoots | Select-Object -Unique)
+
 if (-not $OutDir) {
     $downloads = Join-Path $env:USERPROFILE 'Downloads'
     $stamp = Get-Date -Format 'yyyyMMdd-HHmm'
@@ -287,11 +296,17 @@ foreach ($ch in 'Staging', 'Production') {
             Write-Info "$ch/$($c.Section): pin $pin > exported DLL - fetching raw payload."
             $packed = ConvertTo-PackedVersion $pin
             $binUrl = "$(Get-ChannelBaseUrl $ch)/$($c.Section)/versions/$packed/files/${GenericPayload}.bin"
-            $tmpBin = Join-Path $env:TEMP "$($c.Dll).ota.bin"
-            Invoke-WebRequest -Uri $binUrl -OutFile $tmpBin -UseBasicParsing
-            if (-not (Test-SidecarSha256 $tmpBin "$binUrl.sha256")) { throw "$ch/$($c.Section) payload failed SHA-256 sidecar verification." }
-            Copy-Item $tmpBin $dllPath -Force
-            Remove-Item $tmpBin -Force
+            $cached = Find-OtaCachedPayload $OtaCacheRoots $c.Section $packed "${GenericPayload}.bin"
+            if ($cached -and (Test-SidecarSha256 $cached "$binUrl.sha256")) {
+                Copy-Item $cached $dllPath -Force
+                Write-Info "$ch/$($c.Section): served from the driver's local OTA cache (SHA-256 verified against NVIDIA's sidecar)."
+            } else {
+                $tmpBin = Join-Path $env:TEMP "$($c.Dll).ota.bin"
+                Invoke-WebRequest -Uri $binUrl -OutFile $tmpBin -UseBasicParsing
+                if (-not (Test-SidecarSha256 $tmpBin "$binUrl.sha256")) { throw "$ch/$($c.Section) payload failed SHA-256 sidecar verification." }
+                Copy-Item $tmpBin $dllPath -Force
+                Remove-Item $tmpBin -Force
+            }
         }
     }
 }

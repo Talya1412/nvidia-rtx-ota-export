@@ -26,6 +26,18 @@ function ConvertTo-ShortVersion([string]$FileVersion) {
     return ('{0}.{1}.{2}' -f $maj, $min, $pat)
 }
 
+# Returns the driver's locally cached OTA payload for an exact (section, packed version, file)
+# triple - models\<section>\versions\<packed>\files\<payload> - under any probe root, or $null.
+# READ-ONLY: the cache belongs to NVIDIA's own updater (nvngx_update.exe).
+function Find-OtaCachedPayload([string[]]$Roots, [string]$Section, [string]$Packed, [string]$PayloadFile) {
+    foreach ($r in @($Roots)) {
+        if (-not $r) { continue }
+        $p = Join-Path $r "models\$Section\versions\$Packed\files\$PayloadFile"
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
 # Lowercase hex SHA-256 via the .NET API - deliberately NOT the Get-FileHash cmdlet, which
 # disappears on hosts where PowerShell module autoloading is broken (observed on real machines).
 function Get-FileSha256([string]$Path) {
@@ -103,6 +115,7 @@ function Test-ReleaseTagNewer([string]$Dlss, [string]$Sl, [string]$ExistingTag) 
 }
 
 Export-ModuleMember -Function @(
+    'Find-OtaCachedPayload',
     'Get-OtaSectionVersion',
     'ConvertTo-PackedVersion',
     'ConvertTo-ShortVersion',
