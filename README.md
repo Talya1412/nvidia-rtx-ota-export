@@ -1,4 +1,4 @@
-# nvidia-rtx-ota-export
+﻿# nvidia-rtx-ota-export
 
 [![Latest Release](https://img.shields.io/github/v/release/Talya1412/nvidia-rtx-ota-export?color=76b900&label=latest%20OTA)](https://github.com/Talya1412/nvidia-rtx-ota-export/releases/latest)
 [![ota-release](https://github.com/Talya1412/nvidia-rtx-ota-export/actions/workflows/ota-release.yml/badge.svg)](https://github.com/Talya1412/nvidia-rtx-ota-export/actions/workflows/ota-release.yml)
@@ -76,8 +76,9 @@ Or double-click `run-export.bat`.
    with channel `dev-models` = **staging / pre-release**, `3e933c08-ea30-45ae-93d1-5114edf9c3b9` =
    **production** (same switch as NVIDIA's own Streamline OTA client: registry `NGXCore\CDNServerType`,
    `0 - production / 1 - staging`, see `sl.ota/ota.cpp` in the Streamline SDK).
-   In **Newest** mode (the default) all feeds are compared and each component comes from the
-   newest one (ties prefer the Streamline SDK repo).
+   
+   A dlssnr mirror (RankFTW/rhi-repo) additionally supplies DLSS 5 Neural Rendering builds -
+   NVIDIA-signed only; repacked/unsigned variants are rejected and documented in release notes.
 2. **Resolve versions** — OTA: reads `app_E658700` / `app_E658703` generic app pins for sections
    `dlss`, `dlssd`, `dlssg`, `dlss_override` (the Streamline bundle); SDK: reads the DLL
    FileVersions inside the Streamline SDK zip (`bin/x64`, production flavor).
