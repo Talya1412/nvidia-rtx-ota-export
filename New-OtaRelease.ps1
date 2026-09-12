@@ -109,7 +109,7 @@ Write-Host '==> Packaging 7z' -ForegroundColor Cyan
 $sevenZip = Resolve-7z
 $assetName = "streamline-ota-$($tag.TrimStart('v')).7z"
 $assetPath = Join-Path $work $assetName
-& $sevenZip a -t7z -mx=7 $assetPath (Join-Path $work '*') | Out-Null
+& $sevenZip a -t7z -mx=7 $assetPath (Join-Path $work '*.dll') | Out-Null
 if ($LASTEXITCODE -ne 0) { throw '7z packing failed.' }
 
 # checksums file (machine-readable, also used for next release's changelog diff)
