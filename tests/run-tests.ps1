@@ -147,6 +147,7 @@ Assert-True 'winners: single source -> that source' ($win4.DlssSource -eq 'ota-p
 
 Assert-True 'sdk asset: x64 zip preferred over arch variants' ((Get-SdkZipAssetName @('streamline-sdk-v2.14.1-aarch64.zip', 'streamline-sdk-v2.14.1.zip', 'streamline-sdk-v2.14.1-arm64ec.zip')) -eq 'streamline-sdk-v2.14.1.zip')
 Assert-True 'dlssnr: newer PE accepted regardless of signature status' ((Select-DlssnrBuild @(@{ Tag = 'dlssnr-310.9.0-SF'; Version = '310.9.0'; Pass = $true }, @{ Tag = 'dlssnr-310.8.0'; Version = '310.8.0'; Pass = $true })) -eq 'dlssnr-310.9.0-SF')
+Assert-True 'sdk asset: fallback to any zip' ((Get-SdkZipAssetName @('streamline-2.14.1.zip')) -eq 'streamline-2.14.1.zip')
 
 # ---------------------------------------------------------------- relaxed PE-only export policy
 $hashMismatch = Get-DllAcceptancePolicy $true 'HashMismatch' 'CN=NVIDIA Corporation'
