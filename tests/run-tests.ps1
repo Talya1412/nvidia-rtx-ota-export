@@ -2,6 +2,9 @@
 # Runs under Windows PowerShell 5.1 and PowerShell 7+. Exit 1 on any failure.
 #requires -Version 5.1
 
+param(
+    [switch]$Integration
+)
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -162,9 +165,94 @@ $badPe = Get-DllAcceptancePolicy $false 'Valid' 'CN=NVIDIA Corporation'
 Assert-True 'gate: non-PE is still rejected' (-not $badPe.Accepted)
 
 Assert-True 'pin: exact SHA-256 matches case-insensitively' (Test-Sha256Pin 'ABCDEF0123456789' 'abcdef0123456789')
-Assert-True 'pin: universal asset is explicitly marked UNVERIFIED' ((Get-UnverifiedDlssnrSpec).AssetName -match 'UNVERIFIED')
-Assert-True 'pin: universal asset hash is exact and immutable' ((Get-UnverifiedDlssnrSpec).Sha256 -eq 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a')
-Assert-True 'pin: universal asset has fetchable release URL' ((Get-UnverifiedDlssnrSpec).Url -match '^https://github\.com/Talya1412/nvidia-rtx-ota-export/releases/download/')
+Assert-True 'pin: dlssnr asset is a plain 7z name (UNVERIFIED status lives in release notes, not the filename)' ((Get-UnverifiedDlssnrSpec).AssetName -eq 'nvngx_dlssnr_310.8.0.7z')
+Assert-True 'pin: dlssnr asset hash is exact and immutable' ((Get-UnverifiedDlssnrSpec).Sha256 -eq 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a')
+Assert-True 'pin: dlssnr asset has fetchable release URL' ((Get-UnverifiedDlssnrSpec).Url -match '^https://github\.com/Talya1412/nvidia-rtx-ota-export/releases/download/v310\.9\.1-sl2\.14\.1/nvngx_dlssnr_310\.8\.0\.7z$')
+Assert-True 'pinned 7z: official standalone console build URL' ((Get-Pinned7zrSpec).Url -eq 'https://www.7-zip.org/a/7zr.exe')
+Assert-True 'pinned 7z: SHA-256 pin is the exact recorded digest' ((Get-Pinned7zrSpec).Sha256 -eq 'ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d')
+Assert-True 'pinned 7z: resolver is exported' ($null -ne (Get-Command Resolve-7ZipTool -ErrorAction SilentlyContinue))
+
+
+# ---------------------------------------------------------------- integration suite (frozen release fixtures)
+# Runs with -Integration (also wired into .github/workflows/ota-release.yml). Downloads the real
+# release artifacts listed in tests/fixtures/manifest.json (re-frozen each release), verifies every
+# archive SHA-256, extracts, and validates: exact DLL set, per-group FileVersion consistency,
+# versionless DLLs, per-DLL SHA-256 pins, release-tag identity, and agreement of the frozen dlssnr
+# artifact with the module's pin spec (Get-UnverifiedDlssnrSpec).
+if ($Integration) {
+    Write-Host "`n=== Integration suite: frozen release fixtures ===" -ForegroundColor Cyan
+    $manifestPath = Join-Path $repoRoot 'tests\fixtures\manifest.json'
+    Assert-True 'fixtures: frozen manifest exists' (Test-Path $manifestPath)
+    $fixturesData = Get-Content $manifestPath -Raw | ConvertFrom-Json
+
+    function Test-PeHeader([string]$Path) {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try {
+            $m = New-Object byte[] 2
+            [void]$fs.Read($m, 0, 2)
+            return ($m[0] -eq 0x4D -and $m[1] -eq 0x5A)
+        } finally { $fs.Dispose() }
+    }
+
+    # stable cache dir: re-verified against the manifest pin on every run, so a re-download
+    # only happens when the cached copy is missing or corrupt
+    $cache = Join-Path ([System.IO.Path]::GetTempPath()) 'ota-fixture-cache'
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('ota-fixture-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $groupVersions = @{}
+    try {
+        New-Item -ItemType Directory $work, $cache -Force | Out-Null
+        foreach ($art in $fixturesData.artifacts) {
+            $archive = Join-Path $cache $art.name
+            $pin = $art.sha256.ToLowerInvariant()
+            if ((Test-Path $archive) -and ((Get-FileSha256 $archive).ToLowerInvariant() -ne $pin)) { Remove-Item $archive -Force }
+            if (-not (Test-Path $archive)) {
+                Write-Host "  download $($art.name)" -ForegroundColor DarkGray
+                Invoke-WebRequest -Uri $art.url -OutFile $archive -UseBasicParsing
+            }
+            Assert-True "archive sha256 matches frozen pin: $($art.name)" ((Get-FileSha256 $archive).ToLowerInvariant() -eq $pin)
+
+            $dest = Join-Path $work ($art.name + '.x')
+            Expand-7zArchive $archive $dest
+            $dlls = @(Get-ChildItem $dest -Filter '*.dll')
+            Assert-True "DLL count matches frozen manifest: $($art.name) (expected $($art.expect.dllCount))" ($dlls.Count -eq $art.expect.dllCount)
+            $actualNames = @($dlls | Sort-Object Name | ForEach-Object { $_.Name })
+            $expectedNames = @($art.expect.dllNames | Sort-Object)
+            Assert-True "DLL set matches frozen manifest exactly: $($art.name)" ((Compare-Object $actualNames $expectedNames).Count -eq 0)
+            foreach ($dll in $dlls) { Assert-True "PE gate: $($dll.Name) ($($art.name))" (Test-PeHeader $dll.FullName) }
+
+            foreach ($grp in $art.expect.groups) {
+                $ver = $null; $ok = $true
+                foreach ($dll in ($dlls | Where-Object { $_.Name -match $grp.pattern })) {
+                    $short = ConvertTo-ShortVersion $dll.VersionInfo.FileVersion
+                    if ($short -ne $grp.version) { $ok = $false }
+                    if (-not $ver) { $ver = $short } elseif ($short -ne $ver) { $ok = $false }
+                }
+                if ($grp.id) { $groupVersions[$grp.id] = $ver }
+                Assert-True "dependency consistency: $($grp.name) all share FileVersion $($grp.version) ($($art.name))" $ok
+            }
+            foreach ($name in @($art.expect.versionless)) {
+                $dll = $dlls | Where-Object { $_.Name -eq $name }
+                Assert-True "versionless DLL present with empty FileVersion: $name ($($art.name))" ($null -ne $dll -and [string]::IsNullOrEmpty($dll.VersionInfo.FileVersion))
+            }
+            if ($art.expect.PSObject.Properties['dllSha256']) {
+                foreach ($p in $art.expect.dllSha256.PSObject.Properties) {
+                    $dll = $dlls | Where-Object { $_.Name -eq $p.Name }
+                    Assert-True "DLL sha256 pin: $($p.Name) ($($art.name))" ($null -ne $dll -and (Get-FileSha256 $dll.FullName).ToLowerInvariant() -eq $p.Value.ToLowerInvariant())
+                }
+            }
+        }
+
+        Assert-True "tag identity: dlss FileVersion $($fixturesData.tagIdentity.dlss) matches release tag" ($groupVersions['nvngx'] -eq $fixturesData.tagIdentity.dlss)
+        Assert-True "tag identity: sl FileVersion $($fixturesData.tagIdentity.sl) matches release tag" ($groupVersions['sl'] -eq $fixturesData.tagIdentity.sl)
+
+        $spec = Get-UnverifiedDlssnrSpec
+        $snrFixture = $fixturesData.artifacts | Where-Object { $_.name -eq $spec.AssetName }
+        Assert-True 'frozen dlssnr artifact URL agrees with module pin spec' ($null -ne $snrFixture -and $snrFixture.url -eq $spec.Url)
+        Assert-True 'frozen dlssnr DLL pin agrees with module pin spec' ($null -ne $snrFixture -and $snrFixture.expect.dllSha256.'nvngx_dlssnr.dll' -eq $spec.Sha256)
+    } finally {
+        Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 # ---------------------------------------------------------------- summary
 if ($script:failed -gt 0) {

@@ -1,0 +1,56 @@
+{
+  "_comment": "Frozen fixture manifest for tests/run-tests.ps1 -Integration. Values were recorded from the real GitHub release assets on 2026-09-13 (tag v310.9.1-sl2.14.1). Every archive is hash-pinned; the suite downloads each artifact, verifies the archive SHA-256, extracts, and validates DLL count, FileVersions, and dependency consistency. Re-freeze against the newest release when it ships (and bump tagIdentity).",
+  "frozenUtc": "2026-09-13T05:10:00Z",
+  "sourceTag": "v310.9.1-sl2.14.1",
+  "artifacts": [
+    {
+      "name": "streamline-ota-310.9.1-sl2.14.1.7z",
+      "url": "https://github.com/Talya1412/nvidia-rtx-ota-export/releases/download/v310.9.1-sl2.14.1/streamline-ota-310.9.1-sl2.14.1.7z",
+      "sha256": "34d143331f3f49445659f49b643626ce24e588363043cfa6ba9d5bbbf1fbc034",
+      "expect": {
+        "dllCount": 16,
+        "dllNames": [
+          "NvLowLatencyVk.dll",
+          "nvngx_deepdvc.dll",
+          "nvngx_dlss.dll",
+          "nvngx_dlssd.dll",
+          "nvngx_dlssg.dll",
+          "sl.common.dll",
+          "sl.deepdvc.dll",
+          "sl.directsr.dll",
+          "sl.dlss.dll",
+          "sl.dlss_d.dll",
+          "sl.dlss_g.dll",
+          "sl.interposer.dll",
+          "sl.nis.dll",
+          "sl.nvperf.dll",
+          "sl.pcl.dll",
+          "sl.reflex.dll"
+        ],
+        "groups": [
+          { "id": "nvngx", "name": "DLSS drop (SR/RR/FG/DeepDVC)", "pattern": "^nvngx_", "version": "310.9.1" },
+          { "id": "sl", "name": "Streamline runtime plugins", "pattern": "^sl\\.", "version": "2.14.1" }
+        ],
+        "versionless": ["NvLowLatencyVk.dll"],
+        "dllSha256": {}
+      }
+    },
+    {
+      "name": "nvngx_dlssnr_310.8.0.7z",
+      "url": "https://github.com/Talya1412/nvidia-rtx-ota-export/releases/download/v310.9.1-sl2.14.1/nvngx_dlssnr_310.8.0.7z",
+      "sha256": "3f731e39d7a6e2c4a29326000543c71b24cffc14a02a78060a1918a5e4a5cc03",
+      "expect": {
+        "dllCount": 1,
+        "dllNames": ["nvngx_dlssnr.dll"],
+        "groups": [
+          { "id": "dlssnr", "name": "DLSS 5 Neural Rendering (pinned universal build)", "pattern": "^nvngx_dlssnr", "version": "310.8.0" }
+        ],
+        "versionless": [],
+        "dllSha256": {
+          "nvngx_dlssnr.dll": "e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a"
+        }
+      }
+    }
+  ],
+  "tagIdentity": { "dlss": "310.9.1", "sl": "2.14.1" }
+}

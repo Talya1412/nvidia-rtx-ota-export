@@ -38,21 +38,6 @@ $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $exportScript = Join-Path $repoRoot 'Export-RtxOtaPreRelease.ps1'
 
 # ---------------------------------------------------------------- helpers
-function Resolve-7z {
-    $candidates = @(
-        (Get-Command 7z -ErrorAction SilentlyContinue),
-        (Get-Command 7zr -ErrorAction SilentlyContinue)
-    ) | Where-Object { $_ }
-    foreach ($c in $candidates) { return $c.Source }
-    foreach ($p in @("$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe",
-                     "$env:ProgramFiles\NVIDIA Corporation\NVIDIA App\7z.exe")) {
-        if (Test-Path $p) { return $p }
-    }
-    # official standalone console build, 7z format only
-    $tmp = Join-Path $env:TEMP '7zr.exe'
-    Invoke-WebRequest -Uri 'https://www.7-zip.org/a/7zr.exe' -OutFile $tmp -UseBasicParsing
-    return $tmp
-}
 
 function Get-PreviousChecksums([string]$RepoFull, [string]$PrevTag) {
     # PS 5.1 mangles embedded double quotes in native args, so the name filter happens in
@@ -111,13 +96,10 @@ if ($maxTag -and -not (Test-ReleaseTagNewer $dlssVer $slVer $maxTag)) {
     exit 0
 }
 
-# ---------------------------------------------------------------- 3. package 7z (flat, drop-in)
 Write-Host '==> Packaging 7z' -ForegroundColor Cyan
-$sevenZip = Resolve-7z
 $assetName = "streamline-ota-$($tag.TrimStart('v')).7z"
 $assetPath = Join-Path $work $assetName
-& $sevenZip a -t7z -mx=7 $assetPath (Join-Path $work '*.dll') | Out-Null
-if ($LASTEXITCODE -ne 0) { throw '7z packing failed.' }
+New-7zArchive $assetPath (Join-Path $work '*.dll') | Out-Null
 
 # checksums file (machine-readable, also used for next release's changelog diff)
 $checksumLines = $dlls | Sort-Object Name | ForEach-Object {
@@ -185,7 +167,7 @@ if (-not $prevTag) {
     if (-not $changed.Count -and -not $added.Count -and -not $removed.Count) { $notes += "- No file content changed (version bump only).`n" }
 }
 # DLSS 5 Neural Rendering (dlssnr) section when the export produced one
-$snrAssets = @(Get-ChildItem $work -Filter 'nvngx_dlssnr*.zip' -ErrorAction SilentlyContinue)
+$snrAssets = @(Get-ChildItem $work -Filter 'nvngx_dlssnr*.7z' -ErrorAction SilentlyContinue)
 if ($snrAssets.Count -gt 0) {
     $snrNotePath = Join-Path $work 'dlssnr-notes.txt'
     if (Test-Path $snrNotePath) {

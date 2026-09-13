@@ -14,7 +14,7 @@
      from one source, Streamline plugins from another - always the newest available of each.
   4. Verify: OTA payloads against NVIDIA's published SHA-256 sidecars; every exported file must be
      an MZ PE. Authenticode status is reported, but it is not a hard rejection for allowlisted sources.
-  5. Optional -Zip: package the output into a single ZIP.
+5. Optional -Archive: package the output into a single 7z.
 
   Endpoints (reverse-engineered from NVIDIA's own Streamline OTA client, sl.ota/ota.cpp, registry
   NGXCore\CDNServerType = 0 production / 1 staging; verified live 2026-09-04; see README.md):
@@ -26,8 +26,8 @@
 .PARAMETER OutDir
   Output folder for the exported DLLs. Default: <Downloads>\nvidia-ota-prerelease-<yyyyMMdd-HHmm>.
 
-.PARAMETER Zip
-  Also package OutDir into a single ZIP next to it.
+.PARAMETER Archive
+  Also package OutDir into a single 7z next to it.
 
 .PARAMETER Channel
   Newest (default) tracks every source; Sdk = Streamline SDK GitHub releases only;
@@ -37,12 +37,12 @@
   Drop the GitHub SDK source (offline / rate-limit friendly) - OTA channels only.
 
 .EXAMPLE
-  powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Zip
+  powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Archive
 #>
 [CmdletBinding()]
 param(
     [string]$OutDir = '',
-    [switch]$Zip,
+    [switch]$Archive,
     [ValidateSet('Newest', 'Sdk', 'Staging', 'Production')]
     [string]$Channel = 'Newest',
     [switch]$SkipGitHubCheck
@@ -344,12 +344,12 @@ $dlssnrNote = ''
 if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
     Write-Step 'Checking dlssnr (pinned universal asset first; PE-only mirror fallback)'
     $unverifiedSpec = Get-UnverifiedDlssnrSpec
-    $pinnedZip = Join-Path $env:TEMP ("pinned-" + $unverifiedSpec.AssetName)
+    $pinnedArchive = Join-Path $env:TEMP ("pinned-" + $unverifiedSpec.AssetName)
     $pinnedDir = Join-Path $env:TEMP 'dlssnr-pinned-universal'
     $pinnedAssetPath = Join-Path $OutDir $unverifiedSpec.AssetName
     try {
-        Invoke-WebRequest -Uri $unverifiedSpec.Url -OutFile $pinnedZip -UseBasicParsing
-        Expand-ZipSubset $pinnedZip '' $pinnedDir
+        Invoke-WebRequest -Uri $unverifiedSpec.Url -OutFile $pinnedArchive -UseBasicParsing
+        Expand-7zArchive $pinnedArchive $pinnedDir
         $pinnedDll = Join-Path $pinnedDir 'nvngx_dlssnr.dll'
         $pinnedHash = Get-FileSha256 $pinnedDll
         if (-not (Test-Sha256Pin $pinnedHash $unverifiedSpec.Sha256)) {
@@ -361,7 +361,7 @@ if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
         if (Test-Path $pinnedStage) { Remove-Item $pinnedStage -Recurse -Force }
         New-Item -ItemType Directory -Path $pinnedStage -Force | Out-Null
         Copy-Item $pinnedDll (Join-Path $pinnedStage 'nvngx_dlssnr.dll') -Force
-        [System.IO.Compression.ZipFile]::CreateFromDirectory($pinnedStage, $pinnedAssetPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+        New-7zArchive $pinnedAssetPath (Join-Path $pinnedStage '*.dll') | Out-Null
         Remove-Item $pinnedStage -Recurse -Force
         $dlssnrNote = "- ``$($unverifiedSpec.AssetName)`` (user-pinned universal build, version $($unverifiedSpec.Version)): **UNVERIFIED** Authenticode status; exact DLL SHA-256 ``$pinnedHash`` matches the immutable pin. Source: ``$($unverifiedSpec.Source)``.`n"
         Write-Info "dlssnr universal: pinned SHA-256 verified; publishing $($unverifiedSpec.AssetName)."
@@ -369,7 +369,7 @@ if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
         Write-Warn2 "Pinned universal dlssnr unavailable: $($_.Exception.Message) - trying PE-only mirror fallback."
         $dlssnrNote = "- Pinned universal asset unavailable: $($_.Exception.Message).`n"
     } finally {
-        if (Test-Path $pinnedZip) { Remove-Item $pinnedZip -Force }
+        if (Test-Path $pinnedArchive) { Remove-Item $pinnedArchive -Force }
         if (Test-Path $pinnedDir) { Remove-Item $pinnedDir -Recurse -Force }
     }
 
@@ -397,14 +397,14 @@ if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
                     $snrPassed = (Get-DllVerification $snrDll).Accepted
                     $snrChecked += @{ Tag = $cand.Tag; Version = $verOk; Pass = $snrPassed }
                     if ($snrPassed) {
-                        $assetZip = Join-Path $OutDir "nvngx_dlssnr_$($cand.Version).zip"
+                        $assetArchive = Join-Path $OutDir "nvngx_dlssnr_$($cand.Version).7z"
                         $snrStage = Join-Path $env:TEMP "dlssnr-stage-$($cand.Version)"
                         if (Test-Path $snrStage) { Remove-Item $snrStage -Recurse -Force }
                         New-Item -ItemType Directory -Path $snrStage -Force | Out-Null
                         Copy-Item $snrDll (Join-Path $snrStage 'nvngx_dlssnr.dll') -Force
-                        [System.IO.Compression.ZipFile]::CreateFromDirectory($snrStage, $assetZip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+                        New-7zArchive $assetArchive (Join-Path $snrStage '*.dll') | Out-Null
                         Remove-Item $snrStage -Recurse -Force
-                        $dlssnrNote += "- ``nvngx_dlssnr_$($cand.Version).zip`` (mirror tag ``$($cand.Tag)``): $((Get-DllVerification $snrDll).Label).`n"
+                        $dlssnrNote += "- ``nvngx_dlssnr_$($cand.Version).7z`` (mirror tag ``$($cand.Tag)``): $((Get-DllVerification $snrDll).Label).`n"
                         break
                     } else {
                         Write-Warn2 "dlssnr $($cand.Version) ($($cand.Tag)): rejected because it is not a valid PE image."
@@ -452,12 +452,12 @@ $report | ForEach-Object { "{0}`t{1}`t{2}`t{3}" -f $_.File, $_.Version, $_.Signe
 
 if (-not $allAccepted) { throw 'One or more exported files failed PE validation - inspect output above.' }
 
-if ($Zip) {
-    Write-Step 'Packaging ZIP into Downloads'
-    $zipPath = "$OutDir.zip"
-    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-    [System.IO.Compression.ZipFile]::CreateFromDirectory($OutDir, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
-    $z = Get-Item $zipPath
+if ($Archive) {
+    Write-Step 'Packaging 7z next to the output'
+    $archivePath = "$OutDir.7z"
+    if (Test-Path $archivePath) { Remove-Item $archivePath -Force }
+    New-7zArchive $archivePath (Join-Path $OutDir '*.dll') | Out-Null
+    $z = Get-Item $archivePath
     Write-Info "$($z.FullName) - $([math]::Round($z.Length / 1MB, 1)) MB"
 }
 

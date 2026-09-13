@@ -31,6 +31,10 @@ jobs:
         shell: pwsh
         run: ./tests/run-tests.ps1
 
+      - name: Fixture integration tests (frozen release artifacts)
+        shell: pwsh
+        run: ./tests/run-tests.ps1 -Integration
+
       - name: Export + release on new OTA version
         shell: pwsh
         env:

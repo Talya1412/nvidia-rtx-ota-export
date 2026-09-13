@@ -1,6 +1,8 @@
 # Shared, deterministic logic for the NVIDIA RTX OTA exporter + release publisher.
-# Network and filesystem I/O stay in the entry scripts; everything here is pure and unit-tested
-# (tests/run-tests.ps1). Version comparisons are numeric via [version], never lexicographic.
+# Network and filesystem I/O stay in the entry scripts; everything here is pure and unit-
+# tested (tests/run-tests.ps1); version comparisons are numeric via [version], never
+# lexicographic. Exception: the pinned 7-Zip tool helpers (Get-Pinned7zrSpec, Resolve-7ZipTool,
+# New-7zArchive, Expand-7zArchive) do download + filesystem I/O because both entry scripts share them.
 
 function Get-OtaSectionVersion([string]$Manifest, [string]$Section) {
     $body = [regex]::Match($Manifest, "(?ms)^\[$([regex]::Escape($Section))\]\s*(.*?)(?=^\[|\z)")
@@ -147,12 +149,76 @@ function Test-Sha256Pin([string]$Actual, [string]$Expected) {
     return [bool]($Actual.Trim().ToLowerInvariant() -eq $Expected.Trim().ToLowerInvariant())
 }
 
-# Deliberately selected universal dlssnr artifact supplied by the user. The URL is fetchable by
-# CI; the DLL hash is immutable. It is an UNVERIFIED exception, never a blanket signature bypass.
+# ---------------------------------------------------------------- pinned 7-Zip tool
+# Standalone 7-Zip console build (7z format only, ~0.6 MB) used when no local 7z install exists.
+# Upstream does not Authenticode-sign 7zr.exe, so the SHA-256 pin is the integrity control:
+# every use (fresh download or cached copy) is verified against the pin before execution.
+# Update procedure: download https://www.7-zip.org/a/7zr.exe from the official site, then bump
+# Version + Size + Sha256 together in a single commit.
+function Get-Pinned7zrSpec {
+    return [pscustomobject]@{
+        Url     = 'https://www.7-zip.org/a/7zr.exe'
+        Sha256  = 'ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d'
+        Version = '26.03'
+        Size    = 602624
+    }
+}
+
+# Trusted local installs first (PATH shims, Program Files, NVIDIA App copy); otherwise the
+# hash-pinned official 7zr.exe, downloaded over TLS. A cached copy is re-verified on every
+# call; any mismatch aborts instead of running unverified code.
+function Resolve-7ZipTool {
+    $local = @()
+    foreach ($cmd in '7z', '7zr') {
+        $c = Get-Command $cmd -ErrorAction SilentlyContinue
+        if ($c) { $local += $c.Source }
+    }
+    foreach ($p in @("$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe",
+                     "$env:ProgramFiles\NVIDIA Corporation\NVIDIA App\7z.exe")) {
+        if (Test-Path $p) { $local += $p }
+    }
+    foreach ($p in $local) { if ($p) { return $p } }
+
+    $spec = Get-Pinned7zrSpec
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) '7zr-pinned.exe'
+    if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -ne $spec.Size) {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $spec.Url -OutFile $tmp -UseBasicParsing
+    }
+    $actual = Get-FileSha256 $tmp
+    if (-not (Test-Sha256Pin $actual $spec.Sha256)) {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        throw "Pinned 7-Zip tool failed SHA-256 verification: expected $($spec.Sha256), got $actual - refusing to execute."
+    }
+    return $tmp
+}
+
+# Pack files/dirs (7z glob wildcards allowed in $SourcePaths) into a .7z archive. Throws on failure.
+function New-7zArchive([string]$ArchivePath, [string[]]$SourcePaths, [int]$Level = 7) {
+    $tool = Resolve-7ZipTool
+    $parent = Split-Path -Parent $ArchivePath
+    if ($parent) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    if (Test-Path $ArchivePath) { Remove-Item $ArchivePath -Force }
+    & $tool a -t7z "-mx=$Level" $ArchivePath @SourcePaths | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "7z packing failed (exit $LASTEXITCODE): $ArchivePath" }
+}
+
+# Extract a .7z archive with the resolved 7-Zip tool. Throws on failure.
+function Expand-7zArchive([string]$ArchivePath, [string]$DestDir) {
+    $tool = Resolve-7ZipTool
+    New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+    & $tool x "-o$DestDir" -y $ArchivePath | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "7z extraction failed (exit $LASTEXITCODE): $ArchivePath" }
+}
+
+# Deliberately selected universal dlssnr artifact supplied by the user. Plain asset name; the
+# UNVERIFIED Authenticode status is documented in release notes, not the filename. The URL is
+# fetchable by CI; the DLL hash is immutable - an UNVERIFIED exception, never a blanket
+# signature bypass.
 function Get-UnverifiedDlssnrSpec {
     return [pscustomobject]@{
-        AssetName = 'nvngx_dlssnr-universal-310.8.0-UNVERIFIED.zip'
-        Url       = 'https://github.com/Talya1412/nvidia-rtx-ota-export/releases/download/v310.9.1-sl2.14.1/nvngx_dlssnr-universal-310.8.0-UNVERIFIED.zip'
+        AssetName = 'nvngx_dlssnr_310.8.0.7z'
+        Url       = 'https://github.com/Talya1412/nvidia-rtx-ota-export/releases/download/v310.9.1-sl2.14.1/nvngx_dlssnr_310.8.0.7z'
         Sha256    = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
         Version   = '310.8.0'
         Source    = 'Talya1412/nvidia-rtx-ota-export (user-pinned artifact)'
@@ -174,5 +240,9 @@ function Get-UnverifiedDlssnrSpec {
     'Get-DllAcceptancePolicy',
     'Test-Sha256Pin',
     'Get-UnverifiedDlssnrSpec',
+    'Get-Pinned7zrSpec',
+    'Resolve-7ZipTool',
+    'New-7zArchive',
+    'Expand-7zArchive',
     'Test-ReleaseTagNewer'
 )

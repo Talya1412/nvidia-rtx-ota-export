@@ -22,9 +22,10 @@ export-summary.txt  per-file version + signature status + SHA-256
 export-sources.txt  which feed won each component (dlss=/sl=) + all feeds compared
 ```
 
-> `Newest` also packages DLSS 5 Neural Rendering as a separate per-GPU asset: the pinned universal
-> `nvngx_dlssnr-universal-310.8.0-UNVERIFIED.zip` is accepted only when its exact SHA-256 matches;
-> Authenticode status for allowlisted DLSS/Streamline DLLs is reported, not used as a hard reject.
+> `Newest` also packages DLSS 5 Neural Rendering as a separate per-GPU 7z asset (`nvngx_dlssnr_310.8.0.7z`):
+> the pinned universal build is accepted only when its exact DLL SHA-256 matches; its UNVERIFIED
+> Authenticode status is documented in the release notes. Authenticode status for allowlisted
+> DLSS/Streamline DLLs is reported, not used as a hard reject.
 
 ## Automated releases
 
@@ -43,6 +44,9 @@ It calls `New-OtaRelease.ps1`, which:
    `checksums.txt`, and publishes release notes with a real changelog: version deltas, per-file
    added/changed/removed diff (by SHA-256 against the previous release's checksums), and the
    per-component source table (which feed each component came from) plus the lag of every feed.
+5. runs the **fixture integration tests** first (`tests/run-tests.ps1 -Integration`): downloads the
+   frozen release artifacts listed in `tests/fixtures/manifest.json`, verifies every archive
+   SHA-256, and validates DLL count, FileVersions, and dependency consistency of the shipped sets.
 
 Local run (uses your `gh` login):
 
@@ -54,14 +58,14 @@ Local run (uses your `gh` login):
 
 ```powershell
 # default: newest available across OTA staging/production + Streamline SDK (per component)
-powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Zip
+powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Archive
 
 # SDK-only (Streamline SDK GitHub release, no OTA download)
-powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Channel Sdk -Zip
+powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Channel Sdk -Archive
 
 # force one OTA channel: staging (pre-release) or production (what the driver serves normally)
-powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Channel Staging -Zip
-powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Channel Production -Zip
+powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Channel Staging -Archive
+powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -Channel Production -Archive
 
 # custom output dir
 powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 -OutDir D:\rtx-dlls
@@ -92,8 +96,8 @@ Or double-click `run-export.bat`.
 4. **PE gate + signature report** — every exported file must be a valid PE/MZ image. Authenticode
    status is recorded (`Valid (NVIDIA)` or `UNVERIFIED (...)`), but `Valid` is not required for
    allowlisted DLSS/Streamline sources. OTA payloads still require the NVIDIA SHA-256 sidecar.
-5. **Output + optional ZIP** — writes `export-summary.txt` / `export-sources.txt` and, with
-   `-Zip`, a ready-to-share archive.
+5. **Output + optional archive** — writes `export-summary.txt` / `export-sources.txt` and, with
+   `-Archive`, a ready-to-share flat **7z** (same layout as the release asset).
 
 Verified live 2026-09-13: Streamline SDK (GitHub) served DLSS 310.9.1 + Streamline 2.14.1 while
 OTA staging served 310.9.0 / 2.14.0 and OTA production 310.7.128 / 2.12.128 — the export takes
@@ -104,8 +108,12 @@ OTA staging served 310.9.0 / 2.14.0 and OTA production 310.7.128 / 2.12.128 — 
 - Every exported DLL must be a valid PE/MZ image. Authenticode status is recorded as
   `Valid (NVIDIA)` or `UNVERIFIED (...)`, but it is not a hard reject for allowlisted
   DLSS/Streamline sources. OTA payloads still require NVIDIA's SHA-256 sidecar.
-- The universal `dlssnr` asset is accepted only when its immutable SHA-256 pin matches;
-  its filename and release notes explicitly identify it as `UNVERIFIED`.
+- The universal `dlssnr` asset is accepted only when its immutable SHA-256 pin matches. All
+  archives ship as **7z**; the UNVERIFIED Authenticode status of the pinned `dlssnr` build is
+  documented in the release notes and `dlssnr-notes.txt`, not in the filename.
+- 7-Zip itself is supply-chain controlled: trusted local installs are used when present;
+  otherwise the official standalone `7zr.exe` is downloaded from `7-zip.org` and verified against
+  an exact SHA-256 pin (`Get-Pinned7zrSpec`) before any execution — a mismatched binary is refused.
 - Requires Windows 10/11 with an NVIDIA GPU (PE validation; signatures are reported, not required) and internet access.
 - Endpoint provenance and the payload-layout reverse engineering draw on
   [scubamount/dlss-version-toolkit](https://github.com/scubamount/dlss-version-toolkit) (Apache-2.0).
