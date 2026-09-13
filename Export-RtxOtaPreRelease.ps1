@@ -61,8 +61,11 @@ Import-Module (Join-Path $PSScriptRoot 'Ota.Common.psm1') -Force
 # Microsoft.PowerShell.Security can resolve to an incompatible copy and fail with
 # "type data ... already present" (breaks Get-AuthenticodeSignature). Load the matching copy
 # explicitly, by absolute path; fall back to by-name (pwsh / PowerShell 7 loads its own copy).
-$securityPsd1 = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
-try { Import-Module $securityPsd1 -ErrorAction Stop } catch { Import-Module 'Microsoft.PowerShell.Security' -ErrorAction Stop }
+$securityPsd1 = $null
+if (Test-WindowsHost) {
+    $securityPsd1 = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+}
+try { if ($securityPsd1) { Import-Module $securityPsd1 -ErrorAction Stop } } catch { Import-Module 'Microsoft.PowerShell.Security' -ErrorAction SilentlyContinue }
 
 $ChannelRoots = @{
     Staging    = 'dev-models'
@@ -144,11 +147,15 @@ function Get-DllVerification([string]$Path) {
 
     $status = 'Unavailable'
     $signer = ''
-    try {
-        $sig = Get-AuthenticodeSignature -FilePath $Path
-        $status = [string]$sig.Status
-        if ($sig.SignerCertificate) { $signer = [string]$sig.SignerCertificate.Subject }
-    } catch { }
+    if (Test-WindowsHost) {
+        try {
+            $sig = Get-AuthenticodeSignature -FilePath $Path
+            $status = [string]$sig.Status
+            if ($sig.SignerCertificate) { $signer = [string]$sig.SignerCertificate.Subject }
+        } catch { }
+    } else {
+        $status = 'Unavailable (non-Windows)'
+    }
     $policy = Get-DllAcceptancePolicy $true $status $signer
     if ($policy.Label -like 'UNVERIFIED*') {
         Write-Warn2 "$([System.IO.Path]::GetFileName($Path)): signature $status, signer '$signer' - accepted as UNVERIFIED (PE-only policy)."
@@ -215,25 +222,26 @@ if (($wantStaging -or $wantProduction) -and $ota.Count -eq 0) { throw 'No OTA ma
 
 $sdkSource = $null
 if ($wantSdk) {
-    Write-Step 'Fetching latest Streamline SDK release (GitHub)'
+    Write-Step 'Fetching latest Streamline SDK release (GitHub, redirect probe - no API quota)'
     try {
-        $rel = Get-GitHubJson 'repos/NVIDIA-RTX/Streamline/releases/latest'
-        $zipName = Get-SdkZipAssetName (@($rel.assets) | ForEach-Object { $_.name })
-        if (-not $zipName) { throw 'latest release has no zip asset' }
-        $asset = @($rel.assets) | Where-Object { $_.name -eq $zipName } | Select-Object -First 1
-        $tmpSdkZip = Join-Path $env:TEMP 'streamline-sdk-latest.zip'
-        $tmpSdkDir = Join-Path $env:TEMP 'streamline-sdk-latest'
+        $sdkTag = Get-LatestReleaseTagViaRedirect 'NVIDIA-RTX/Streamline'
+        if (-not $sdkTag) { throw 'latest tag unreachable via redirect' }
+        $sdkAsset = Get-SdkZipAssetName @("streamline-sdk-$sdkTag.zip")
+        if (-not $sdkAsset) { $sdkAsset = "streamline-sdk-$sdkTag.zip" }
+        $sdkUrl = "https://github.com/NVIDIA-RTX/Streamline/releases/download/$sdkTag/$sdkAsset"
+        $tmpSdkZip = Join-Path (Get-TempRoot) 'streamline-sdk-latest.zip'
+        $tmpSdkDir = Join-Path (Get-TempRoot) 'streamline-sdk-latest'
         if (Test-Path $tmpSdkDir) { Remove-Item $tmpSdkDir -Recurse -Force }
-        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmpSdkZip -UseBasicParsing
+        Invoke-WebRequest -Uri $sdkUrl -OutFile $tmpSdkZip -UseBasicParsing
         Expand-ZipSubset $tmpSdkZip 'bin/x64' $tmpSdkDir
         Remove-Item $tmpSdkZip -Force
         $sdkSource = @{
-            Tag  = $rel.tag_name
+            Tag  = $sdkTag
             Dir  = $tmpSdkDir
-            Dlss = ConvertTo-ShortVersion (Get-Item (Join-Path $tmpSdkDir 'nvngx_dlss.dll')).VersionInfo.FileVersion
-            Sl   = ConvertTo-ShortVersion (Get-Item (Join-Path $tmpSdkDir 'sl.common.dll')).VersionInfo.FileVersion
+            Dlss = ConvertTo-ShortVersion (Get-FilePeVersion (Join-Path $tmpSdkDir 'nvngx_dlss.dll'))
+            Sl   = ConvertTo-ShortVersion (Get-FilePeVersion (Join-Path $tmpSdkDir 'sl.common.dll'))
         }
-        Write-Info "Streamline SDK $($rel.tag_name): DLSS $($sdkSource.Dlss) / SL $($sdkSource.Sl)"
+        Write-Info "Streamline SDK ${sdkTag}: DLSS $($sdkSource.Dlss) / SL $($sdkSource.Sl)"
     } catch {
         Write-Warn2 "Streamline SDK source unavailable: $($_.Exception.Message) - continuing without it."
     }
@@ -244,24 +252,23 @@ if ($wantSdk) {
 # live: 310.9.1 there is bit-identical to the Streamline SDK and the rhi-repo mirror bytes.
 $dlssRepo = $null
 if ($wantDlssRepo) {
-    Write-Step 'Fetching latest NVIDIA/DLSS release (GitHub)'
+    Write-Step 'Fetching latest NVIDIA/DLSS release (GitHub, redirect probe - no API quota)'
     try {
-        $drel = Get-GitHubJson 'repos/NVIDIA/DLSS/releases/latest'
-        $demoName = Get-DlssRepoAssetName (@($drel.assets) | ForEach-Object { $_.name })
-        if (-not $demoName) { throw 'latest release has no Windows demo asset' }
-        $dasset = @($drel.assets) | Where-Object { $_.name -eq $demoName } | Select-Object -First 1
-        $tmpDemoZip = Join-Path $env:TEMP 'dlss-demo-latest.zip'
-        $tmpDemoDir = Join-Path $env:TEMP 'dlss-demo-latest'
+        $dlssTag = Get-LatestReleaseTagViaRedirect 'NVIDIA/DLSS'
+        if (-not $dlssTag) { throw 'latest tag unreachable via redirect' }
+        $demoUrl = "https://github.com/NVIDIA/DLSS/releases/download/$dlssTag/ngx_dlss_demo_windows.zip"
+        $tmpDemoZip = Join-Path (Get-TempRoot) 'dlss-demo-latest.zip'
+        $tmpDemoDir = Join-Path (Get-TempRoot) 'dlss-demo-latest'
         if (Test-Path $tmpDemoDir) { Remove-Item $tmpDemoDir -Recurse -Force }
-        Invoke-WebRequest -Uri $dasset.browser_download_url -OutFile $tmpDemoZip -UseBasicParsing
+        Invoke-WebRequest -Uri $demoUrl -OutFile $tmpDemoZip -UseBasicParsing
         Expand-ZipSubset $tmpDemoZip 'DLSS_Sample_App/bin/ngx_dlss_demo' $tmpDemoDir
         Remove-Item $tmpDemoZip -Force
         $dlssRepo = @{
-            Tag  = $drel.tag_name
+            Tag  = $dlssTag
             Dir  = $tmpDemoDir
-            Dlss = ConvertTo-ShortVersion (Get-Item (Join-Path $tmpDemoDir 'nvngx_dlss.dll')).VersionInfo.FileVersion
+            Dlss = ConvertTo-ShortVersion (Get-FilePeVersion (Join-Path $tmpDemoDir 'nvngx_dlss.dll'))
         }
-        Write-Info "NVIDIA/DLSS $($drel.tag_name): DLSS $($dlssRepo.Dlss) (SR only)"
+        Write-Info "NVIDIA/DLSS ${dlssTag}: DLSS $($dlssRepo.Dlss) (SR only)"
     } catch {
         Write-Warn2 "NVIDIA/DLSS source unavailable: $($_.Exception.Message) - continuing without it."
     }
@@ -270,13 +277,18 @@ if ($wantDlssRepo) {
 # rhi-repo mirrors: exact re-hosts of official builds (verified bit-identical for dlss/dlssd/
 # dlssg/streamline), newest-first per section. They are NOT raced against official feeds - they
 # only serve as a rescue path when an official download fails, and only after the fetched bytes
-# match a trusted pin (OTA SHA-256 sidecar or the previous release's checksums).
+# match a trusted pin (OTA SHA-256 sidecar or the previous release's checksums). Enumeration
+# uses the git protocol (git ls-remote) - zero API quota; the REST API is only a fallback.
 $mirrors = @{}
 if (-not $SkipGitHubCheck) {
     try {
-        $rhiRels = Get-GitHubJson 'repos/RankFTW/rhi-repo/releases?per_page=100'
+        $rhiTags = Get-RhiTagsViaGit
+        if (-not $rhiTags) {
+            $rhiRels = Get-GitHubJson 'repos/RankFTW/rhi-repo/releases?per_page=100'
+            $rhiTags = @($rhiRels) | ForEach-Object { $_.tag_name }
+        }
         foreach ($sec in 'dlss', 'dlssd', 'dlssg', 'streamline', 'dlssnr') {
-            $mirrors[$sec] = @(Get-RhiMirrorBuilds @($rhiRels) $sec)
+            $mirrors[$sec] = @(Get-RhiMirrorBuilds @($rhiTags) $sec)
         }
         Write-Info "rhi-repo mirrors: dlss=$(@($mirrors['dlss']).Count) dlssd=$(@($mirrors['dlssd']).Count) dlssg=$(@($mirrors['dlssg']).Count) streamline=$(@($mirrors['streamline']).Count) dlssnr=$(@($mirrors['dlssnr']).Count)"
     } catch {
@@ -319,10 +331,10 @@ function Get-Sha256Sidecar([string]$SidecarUrl) {
 function Get-MirrorDll([object[]]$Candidates, [string]$DllName, [string]$TrustedSha, [string]$DestPath) {
     foreach ($cand in @($Candidates)) {
         if (-not $cand) { continue }
-        $tmpZip = Join-Path $env:TEMP "mirror-$($cand.Tag).zip"
-        $tmpDir = Join-Path $env:TEMP "mirror-$($cand.Tag)"
+        $tmpZip = Join-Path (Get-TempRoot) "mirror-$($cand.Tag).zip"
+        $tmpDir = Join-Path (Get-TempRoot) "mirror-$($cand.Tag)"
         try {
-            Invoke-WebRequest -Uri $cand.Asset.browser_download_url -OutFile $tmpZip -UseBasicParsing
+            Invoke-WebRequest -Uri $cand.DownloadUrl -OutFile $tmpZip -UseBasicParsing
             Expand-ZipSubset $tmpZip '' $tmpDir
             $dll = Join-Path $tmpDir $DllName
             if (-not (Test-Path $dll)) {
@@ -379,7 +391,7 @@ if ($winners.SlSource -eq 'sdk-streamline') {
     $packedSdk = ConvertTo-PackedVersion $slPin
     $slsdkUrl = "$(Get-ChannelBaseUrl $baseChannel)/sl_sdk_0/versions/$packedSdk/files/160_E658703.zip"
     Write-Step "Downloading $baseChannel sl_sdk_0 payload (pin $slPin)"
-    $tmpSlsdkZip = Join-Path $env:TEMP "nvngx_slsdk_$packedSdk.zip"
+    $tmpSlsdkZip = Join-Path (Get-TempRoot) "nvngx_slsdk_$packedSdk.zip"
     $baseReady = $false
     try {
         Invoke-WebRequest -Uri $slsdkUrl -OutFile $tmpSlsdkZip -UseBasicParsing
@@ -394,12 +406,12 @@ if ($winners.SlSource -eq 'sdk-streamline') {
     }
     if (-not $baseReady) {
         $packed = ConvertTo-PackedVersion $o.Sl
-        $tmpZip = Join-Path $env:TEMP "nvngx_ota_bundle_$packed.zip"
+        $tmpZip = Join-Path (Get-TempRoot) "nvngx_ota_bundle_$packed.zip"
         $url = "$(Get-ChannelBaseUrl $baseChannel)/dlss_override/versions/$packed/files/${GenericPayload}.zip"
         try {
             Invoke-WebRequest -Uri $url -OutFile $tmpZip -UseBasicParsing
             if (-not (Test-SidecarSha256 $tmpZip "$url.sha256")) { throw "$baseChannel dlss_override bundle failed SHA-256 sidecar verification." }
-            $dir = Join-Path $env:TEMP "nvngx_ota_extract_$packed"
+            $dir = Join-Path (Get-TempRoot) "nvngx_ota_extract_$packed"
             if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
             [System.IO.Compression.ZipFile]::ExtractToDirectory($tmpZip, $dir)
             $payload = Get-ChildItem $dir -Directory | Select-Object -First 1
@@ -452,7 +464,7 @@ foreach ($ch in 'Staging', 'Production') {
             Write-Warn2 "$($c.Dll) missing from export; $ch serves it at $pin - fetching raw payload."
             $needFetch = $true
         } else {
-            $needFetch = Compare-OtaNewer $pin (ConvertTo-ShortVersion (Get-Item $dllPath).VersionInfo.FileVersion)
+            $needFetch = Compare-OtaNewer $pin (ConvertTo-ShortVersion (Get-FilePeVersion $dllPath))
         }
         if ($needFetch) {
             Write-Info "$ch/$($c.Section): pin $pin > exported DLL - fetching raw payload."
@@ -463,7 +475,7 @@ foreach ($ch in 'Staging', 'Production') {
                 Copy-Item $cached $dllPath -Force
                 Write-Info "$ch/$($c.Section): served from the driver's local OTA cache (SHA-256 verified against NVIDIA's sidecar)."
             } else {
-                $tmpBin = Join-Path $env:TEMP "$($c.Dll).ota.bin"
+                $tmpBin = Join-Path (Get-TempRoot) "$($c.Dll).ota.bin"
                 try {
                     Invoke-WebRequest -Uri $binUrl -OutFile $tmpBin -UseBasicParsing
                     if (-not (Test-SidecarSha256 $tmpBin "$binUrl.sha256")) { throw 'payload failed SHA-256 sidecar verification.' }
@@ -507,10 +519,10 @@ if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
     $snrRejected = @()
     foreach ($cand in $snrOrdered) {
         $ext = if ($cand.Kind -eq 'pinned') { '.7z' } else { '.zip' }
-        $tmpZip = Join-Path $env:TEMP ("dlssnr-" + ($cand.Tag -replace '[^A-Za-z0-9.-]', '_') + $ext)
-        $tmpDir = Join-Path $env:TEMP ("dlssnr-" + ($cand.Tag -replace '[^A-Za-z0-9.-]', '_'))
+        $tmpZip = Join-Path (Get-TempRoot) ("dlssnr-" + ($cand.Tag -replace '[^A-Za-z0-9.-]', '_') + $ext)
+        $tmpDir = Join-Path (Get-TempRoot) ("dlssnr-" + ($cand.Tag -replace '[^A-Za-z0-9.-]', '_'))
         try {
-            $sourceUrl = if ($cand.Kind -eq 'pinned') { $cand.Spec.Url } else { $cand.Cand.Asset.browser_download_url }
+            $sourceUrl = if ($cand.Kind -eq 'pinned') { $cand.Spec.Url } else { $cand.Cand.DownloadUrl }
             Invoke-WebRequest -Uri $sourceUrl -OutFile $tmpZip -UseBasicParsing
             if ($cand.Kind -eq 'pinned') { Expand-7zArchive $tmpZip $tmpDir } else { Expand-ZipSubset $tmpZip '' $tmpDir }
             $snrDll = Join-Path $tmpDir 'nvngx_dlssnr.dll'
@@ -521,8 +533,8 @@ if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
             }
             $verification = Get-DllVerification $snrDll
             if (-not $verification.Accepted) { throw 'not a valid PE image' }
-            $candVersion = ConvertTo-ShortVersion (Get-Item $snrDll).VersionInfo.FileVersion
-            $stage = Join-Path $env:TEMP ('dlssnr-stage-' + ($cand.Tag -replace '[^A-Za-z0-9.-]', '_'))
+            $candVersion = ConvertTo-ShortVersion (Get-FilePeVersion $snrDll)
+            $stage = Join-Path (Get-TempRoot) ('dlssnr-stage-' + ($cand.Tag -replace '[^A-Za-z0-9.-]', '_'))
             if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
             New-Item -ItemType Directory -Path $stage -Force | Out-Null
             Copy-Item $snrDll (Join-Path $stage 'nvngx_dlssnr.dll') -Force
@@ -570,7 +582,7 @@ Get-ChildItem $OutDir -Filter '*.dll' | Sort-Object Name | ForEach-Object {
     $report += [pscustomobject]@{
         File     = $_.Name
         SizeMB   = [math]::Round($_.Length / 1MB, 1)
-        Version  = $_.VersionInfo.FileVersion
+        Version  = Get-FilePeVersion $_.FullName
         Signed   = $verification.Label
         Sha256   = Get-FileSha256 $_.FullName
     }

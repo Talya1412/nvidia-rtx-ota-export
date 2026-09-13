@@ -46,7 +46,7 @@ function Get-PreviousChecksums([string]$RepoFull, [string]$PrevTag) {
         $rel = gh api "repos/$RepoFull/releases/tags/$PrevTag" 2>$null | ConvertFrom-Json
         $asset = @($rel.assets) | Where-Object { $_.name -eq 'checksums.txt' } | Select-Object -First 1
         if (-not $asset) { return $null }
-        $tmp = Join-Path $env:TEMP 'prev-checksums.txt'
+        $tmp = Join-Path (Get-TempRoot) 'prev-checksums.txt'
         gh api -H 'Accept: application/octet-stream' "repos/$RepoFull/releases/assets/$($asset.id)" > $tmp 2>$null
         if ((Get-Item $tmp).Length -gt 0) { return (Get-Content $tmp) }
     } catch { }
@@ -65,6 +65,9 @@ $otaChannelRoots = @{ Staging = 'dev-models'; Production = '3e933c08-ea30-45ae-9
 $otaManifestPath = 'config/versions/2/files/nvngx_server_config.txt'
 $ghHeaders = if ($env:GH_TOKEN) { @{ Authorization = "Bearer $($env:GH_TOKEN)" } } else { @{} }
 function Get-LatestTag([string]$RepoSlug) {
+    # primary: releases/latest 302 redirect (no API quota, no auth); fallback: REST API
+    $tag = Get-LatestReleaseTagViaRedirect $RepoSlug
+    if ($tag) { return [string]$tag }
     try {
         $r = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/releases/latest" -Headers $ghHeaders -TimeoutSec 20
         return [string]$r.tag_name
@@ -92,8 +95,12 @@ foreach ($ch in 'Staging', 'Production') {
     } catch { Write-Host "    ! $ch manifest unreachable" -ForegroundColor Yellow }
 }
 try {
-    $rhiRels = Invoke-RestMethod -Uri 'https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100' -Headers $ghHeaders -TimeoutSec 20
-    $snr = @(Get-RhiMirrorBuilds @($rhiRels) 'dlssnr')
+    $rhiTags = Get-RhiTagsViaGit
+    if (-not $rhiTags) {
+        $rhiRels = Invoke-RestMethod -Uri 'https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100' -Headers $ghHeaders -TimeoutSec 20
+        $rhiTags = @($rhiRels) | ForEach-Object { $_.tag_name }
+    }
+    $snr = @(Get-RhiMirrorBuilds @($rhiTags) 'dlssnr')
     if ($snr.Count) {
         $mirrorMax = [string]$snr[0].Version
         $cur = $probeLive.dlssnrMirrorMax
@@ -110,7 +117,7 @@ try {
     if ($newestRel) {
         $probeAsset = @($newestRel.assets) | Where-Object { $_.name -eq 'probe-state.json' } | Select-Object -First 1
         if ($probeAsset) {
-            $probeTmp = Join-Path $env:TEMP 'ota-probe-state.json'
+            $probeTmp = Join-Path (Get-TempRoot) 'ota-probe-state.json'
             gh api -H 'Accept: application/octet-stream' "repos/$Repo/releases/assets/$($probeAsset.id)" > $probeTmp 2>$null
             if ((Get-Item $probeTmp).Length -gt 0) { $storedProbe = Get-Content $probeTmp -Raw | ConvertFrom-Json }
         }
@@ -125,7 +132,7 @@ if ($probeHealthy -and -not (Test-ProbeStateDiffers $probeLive $storedProbe)) {
     exit 0
 }
 Write-Host '    Feed state changed - running the full export.' -ForegroundColor Cyan
-$probeStatePath = Join-Path $env:TEMP 'probe-state.json'
+$probeStatePath = Join-Path (Get-TempRoot) 'probe-state.json'
 $probeLive | ConvertTo-Json | Set-Content $probeStatePath -Encoding UTF8
 
 Write-Host '==> Exporting current newest state' -ForegroundColor Cyan
@@ -145,8 +152,8 @@ if (Test-Path $sourcesFile) {
 }
 
 $dlls = Get-ChildItem $work -Filter '*.dll'
-$dlssVer = ConvertTo-ShortVersion (Get-Item (Join-Path $work 'nvngx_dlss.dll')).VersionInfo.FileVersion
-$slVer   = ConvertTo-ShortVersion (Get-Item (Join-Path $work 'sl.common.dll')).VersionInfo.FileVersion
+$dlssVer = ConvertTo-ShortVersion (Get-FilePeVersion (Join-Path $work 'nvngx_dlss.dll'))
+$slVer   = ConvertTo-ShortVersion (Get-FilePeVersion (Join-Path $work 'sl.common.dll'))
 $tag = "v$dlssVer-sl$slVer"
 Write-Host "    DLSS $dlssVer / Streamline $slVer -> tag $tag"
 $signatureRows = @()
@@ -181,7 +188,7 @@ New-7zArchive $assetPath (Join-Path $work '*.dll') | Out-Null
 
 # checksums file (machine-readable, also used for next release's changelog diff)
 $checksumLines = $dlls | Sort-Object Name | ForEach-Object {
-    $short = ConvertTo-ShortVersion $_.VersionInfo.FileVersion
+$short = ConvertTo-ShortVersion (Get-FilePeVersion $_.FullName)
     $hash = Get-FileSha256 $_.FullName
     "$($_.Name)`t$short`t$hash"
 }
@@ -206,8 +213,8 @@ foreach ($line in $checksumLines) {
     else { $unchanged += $p[0] }
 }
 
-$ghDlss = try { (Invoke-RestMethod 'https://api.github.com/repos/NVIDIA/DLSS/releases/latest' -TimeoutSec 20).tag_name } catch { 'unavailable' }
-$ghSl   = try { (Invoke-RestMethod 'https://api.github.com/repos/NVIDIA-RTX/Streamline/releases/latest' -TimeoutSec 20).tag_name } catch { 'unavailable' }
+$ghDlss = Get-LatestReleaseTagViaRedirect 'NVIDIA/DLSS';            if (-not $ghDlss) { $ghDlss = 'unavailable' }
+$ghSl   = Get-LatestReleaseTagViaRedirect 'NVIDIA-RTX/Streamline'; if (-not $ghSl)   { $ghSl   = 'unavailable' }
 
 $notes = @"
 # NVIDIA RTX OTA $tag

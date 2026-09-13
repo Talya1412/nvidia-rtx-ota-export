@@ -9,17 +9,23 @@ Ray Reconstruction / Frame Generation runtime and the Streamline plugin set — 
 **every available feed**: the NGX OTA **staging** (pre-release) and **production** channels, the
 official **Streamline SDK** GitHub releases, and the official **NVIDIA/DLSS** GitHub releases
 (runtime demo with `nvngx_dlss.dll`). Each component (DLSS, Streamline) independently comes from
-whichever feed is newest. **rhi-repo** mirrors (dlss/dlssd/dlssg/streamline/dlssnr) are indexed as
 a hash-verified rescue path — never raced, never shipped unverified.
 
-One command (or double-click `run-export.bat`) produces a PE-validated folder of drop-in DLLs:
+## Quick start
+
+Windows: double-click **`run-export.bat`**. Linux/macOS: run **`./run-export.sh`**
+(needs [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/installing-powershell)).
+You get a folder in `Downloads` with the newest, PE-validated, drop-in DLLs plus a ready-to-share
+7z next to it — that is all most people need; the sections below are the automation guts.
+
+The exported folder:
 
 ```
 nvngx_dlss.dll      DLSS Super Resolution   (newest available build, e.g. 310.9.1)
 nvngx_dlssd.dll     DLSS Ray Reconstruction
 nvngx_dlssg.dll     DLSS Frame Generation
 sl.common.dll       Streamline 2.x runtime plugins
-sl.dlss.dll / sl.dlss_d.dll / sl.dlss_g.dll / sl.deepdvc.dll / sl.nis.dll / sl.nvperf.dll / sl.pcl.dll / sl.reflex.dll
+sl.dlss.dll / sl.dlss_d.dll / sl.dlss_g.dll / sl.deepdvc.dll / sl.directsr.dll / sl.nis.dll / sl.nvperf.dll / sl.pcl.dll / sl.reflex.dll
 export-summary.txt  per-file version + signature status + SHA-256
 export-sources.txt  which feed won each component (dlss=/sl=) + all feeds compared
 ```

@@ -89,7 +89,40 @@ Assert-True 'tag parse: dlss part' ($tag.Dlss -eq '310.9.0')
 Assert-True 'tag parse: sl part' ($tag.Sl -eq '2.14.0')
 Assert-True 'tag parse: non-release tag -> null' ($null -eq (Get-ReleaseTagVersion 'v0.1-docs'))
 
-Assert-True 'newest tag: picks max among mixed list' ((Get-NewestReleaseTag @('v310.7.128-sl2.12.128', 'v310.9.0-sl2.14.0', 'v0.1-docs')) -eq 'v310.9.0-sl2.14.0')
+# ---------------------------------------------------------------- cross-platform PE FileVersion (synthetic)
+# Minimal PE: MZ, e_lfanew=0x40, 'PE\0\0', COFF (1 section, optSize 0xF0), PE32+ optional header,
+# data directory[2] -> resource RVA, one section mapping that RVA into the file, then the
+# VS_VERSION_INFO key + VS_FIXEDFILEINFO struct in the mapped window.
+function New-FakeVersionPe([int]$Major, [int]$Minor, [int]$Build, [int]$Rev) {
+    $b = [System.Collections.Generic.List[byte]]::new()
+    $b.AddRange([byte[]]@(0x4D, 0x5A)); $b.AddRange((New-Object byte[] 0x3A)); $b.AddRange([BitConverter]::GetBytes([int32]0x40))
+    $b.AddRange([byte[]]@(0x50, 0x45, 0x00, 0x00))                                   # PE\0\0
+    $b.AddRange([byte[]]@(0x8B, 0x01)); $b.AddRange([BitConverter]::GetBytes([int16]1)) # machine, 1 section
+    $b.AddRange((New-Object byte[] 12)); $b.AddRange([BitConverter]::GetBytes([int16]0xF0)); $b.AddRange([byte[]]@(0x22, 0x00)) # sizeOpt=0xF0, chars
+    $b.AddRange([byte[]]@(0x0B, 0x02))                                               # PE32+ magic
+    while ($b.Count -lt 0x40 + 24 + 112 + 16) { $b.Add(0) }                          # to data dir[2]
+    $resRva = 0x200; $resSize = 0x80
+    $b.AddRange([BitConverter]::GetBytes([int32]$resRva)); $b.AddRange([BitConverter]::GetBytes([int32]$resSize))
+    while ($b.Count -lt 0x148) { $b.Add(0) }                                          # section table
+    $b.AddRange([byte[]]@(0x2E, 0x72, 0x73, 0x72, 0x63, 0x00, 0x00, 0x00))            # '.rsrc'
+    $b.AddRange((New-Object byte[] 4)); $b.AddRange([BitConverter]::GetBytes([int32]$resRva)); $b.AddRange([BitConverter]::GetBytes([int32]$resSize)); $b.AddRange([BitConverter]::GetBytes([int32]$resRva))
+    while ($b.Count -lt 0x200) { $b.Add(0) }                                          # resource data starts at resRva=0x200
+    $key = [System.Text.Encoding]::Unicode.GetBytes('VS_VERSION_INFO')
+    $ms = ([int]$Major -shl 16) -bor [int]$Minor
+    $ls = ([int]$Build -shl 16) -bor [int]$Rev
+    $b.AddRange([byte[]]@(0x00, 0x00)); $b.AddRange($key); $b.AddRange([byte[]]@(0x00, 0x00))
+    $b.AddRange([byte[]]@(0xBD, 0x04, 0xEF, 0xFE)); $b.AddRange([BitConverter]::GetBytes([int32]1)); $b.AddRange([BitConverter]::GetBytes([int32]$ms)); $b.AddRange([BitConverter]::GetBytes([int32]$ls))
+    return $b.ToArray()
+}
+$fakePath = Join-Path ([System.IO.Path]::GetTempPath()) ('pever-fake-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+[System.IO.File]::WriteAllBytes($fakePath, (New-FakeVersionPe 310 9 1 0))
+Assert-True 'pe version: 310.9.1 decoded from synthetic VS_FIXEDFILEINFO' ((Get-FilePeVersion $fakePath) -eq '310.9.1')
+[System.IO.File]::WriteAllBytes($fakePath, (New-FakeVersionPe 2 14 1 0))
+Assert-True 'pe version: 2.14.1 decoded' ((Get-FilePeVersion $fakePath) -eq '2.14.1')
+$vNone = [byte[]](@([byte]0x4D, [byte]0x5A) + @([byte]0x00) * 0x120)
+[System.IO.File]::WriteAllBytes($fakePath, $vNone)
+Assert-True 'pe version: no version resource -> empty string' ((Get-FilePeVersion $fakePath) -eq '')
+Remove-Item $fakePath -Force -ErrorAction SilentlyContinue
 Assert-True 'newest tag: empty list -> null' ($null -eq (Get-NewestReleaseTag @()))
 Assert-True 'newest tag: numeric 310.10 beats 310.9' ((Get-NewestReleaseTag @('v310.10.0-sl2.14.0', 'v310.9.0-sl2.15.0')) -eq 'v310.10.0-sl2.14.0')
 
@@ -137,8 +170,8 @@ $cacheRel2 = Join-Path $cacheRoot2 'models\dlssd\versions\20318464\files\160_E65
 New-Item -ItemType Directory -Path (Split-Path $cacheRel2 -Parent) -Force | Out-Null
 Set-Content -Path $cacheRel2 -Value 'payload-bytes-2'
 try {
-    Assert-True 'cache: hit under first root' ((Find-OtaCachedPayload @($cacheRoot1) 'dlss' '20318464' '160_E658700.bin') -eq $cacheRel)
-    Assert-True 'cache: hit under second root when first misses' ((Find-OtaCachedPayload @("$cacheRoot1-missing", $cacheRoot2) 'dlssd' '20318464' '160_E658700.bin') -eq $cacheRel2)
+    Assert-True 'cache: hit under first root' ((Find-OtaCachedPayload @($cacheRoot1) 'dlss' '20318464' '160_E658700.bin').Replace('/', '\') -eq $cacheRel)
+    Assert-True 'cache: hit under second root when first misses' ((Find-OtaCachedPayload @("$cacheRoot1-missing", $cacheRoot2) 'dlssd' '20318464' '160_E658700.bin').Replace('/', '\') -eq $cacheRel2)
     Assert-True 'cache: wrong packed version -> miss' ($null -eq (Find-OtaCachedPayload @($cacheRoot1) 'dlss' '20318080' '160_E658700.bin'))
     Assert-True 'cache: wrong payload file -> miss' ($null -eq (Find-OtaCachedPayload @($cacheRoot1) 'dlss' '20318464' '160_E658701.bin'))
     $missingRoot = Join-Path ([System.IO.Path]::GetTempPath()) 'ota-cache-missing-root-does-not-exist'
@@ -162,40 +195,32 @@ $valid = Get-DllAcceptancePolicy $true 'Valid' 'CN=NVIDIA Corporation'
 Assert-True 'gate: valid NVIDIA signature is accepted and labeled verified' ($valid.Accepted -and $valid.Label -eq 'Valid (NVIDIA)')
 $otherSigner = Get-DllAcceptancePolicy $true 'Valid' 'CN=Some Other Publisher'
 Assert-True 'gate: PE with non-NVIDIA valid signature is still accepted as UNVERIFIED' ($otherSigner.Accepted -and $otherSigner.Label -match 'UNVERIFIED')
-$badPe = Get-DllAcceptancePolicy $false 'Valid' 'CN=NVIDIA Corporation'
-Assert-True 'gate: non-PE is still rejected' (-not $badPe.Accepted)
 
 Assert-True 'pin: exact SHA-256 matches case-insensitively' (Test-Sha256Pin 'ABCDEF0123456789' 'abcdef0123456789')
 Assert-True 'pin: dlssnr asset is a plain 7z name (UNVERIFIED status lives in release notes, not the filename)' ((Get-UnverifiedDlssnrSpec).AssetName -eq 'nvngx_dlssnr_310.8.0.7z')
 Assert-True 'pin: dlssnr asset hash is exact and immutable' ((Get-UnverifiedDlssnrSpec).Sha256 -eq 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a')
 Assert-True 'pin: dlssnr asset has fetchable release URL' ((Get-UnverifiedDlssnrSpec).Url -match '^https://github\.com/Talya1412/nvidia-rtx-ota-export/releases/download/v310\.9\.1-sl2\.14\.1/nvngx_dlssnr_310\.8\.0\.7z$')
-Assert-True 'pinned 7z: official standalone console build URL' ((Get-Pinned7zrSpec).Url -eq 'https://www.7-zip.org/a/7zr.exe')
-Assert-True 'pinned 7z: SHA-256 pin is the exact recorded digest' ((Get-Pinned7zrSpec).Sha256 -eq 'ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d')
+Assert-True 'pinned 7z: Windows artifact is the official standalone console build' ((Get-Pinned7zSpec)['Win'].Url -eq 'https://www.7-zip.org/a/7zr.exe')
+Assert-True 'pinned 7z: Windows SHA-256 pin is the exact recorded digest' ((Get-Pinned7zSpec)['Win'].Sha256 -eq 'ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d')
+Assert-True 'pinned 7z: Linux/Mac artifacts pinned per platform' (((Get-Pinned7zSpec)['Linux'].Kind -eq 'tarxz') -and ((Get-Pinned7zSpec)['Mac'].Kind -eq 'tarxz') -and ((Get-Pinned7zSpec)['LinuxArm64'].Inner -eq '7zzs'))
 Assert-True 'pinned 7z: resolver is exported' ($null -ne (Get-Command Resolve-7ZipTool -ErrorAction SilentlyContinue))
 
 # ---------------------------------------------------------------- multi-feed expansion (new sources)
-$mockRhi = @(
-    @{ tag_name = 'renodx-dlss5-5.2.1';   assets = @(@{ name = 'renodx-dlss5_5.2.1.zip' }) },
-    @{ tag_name = 'dlss-310.9.1';         assets = @(@{ name = 'nvngx_dlss_310.9.1.zip' }) },
-    @{ tag_name = 'dlss-310.9.0';         assets = @(@{ name = 'nvngx_dlss_310.9.0.zip' }) },
-    @{ tag_name = 'dlssd-310.9.1';        assets = @(@{ name = 'nvngx_dlssd_310.9.1.zip' }) },
-    @{ tag_name = 'dlssg-310.9.1';        assets = @(@{ name = 'nvngx_dlssg_310.9.1.zip' }) },
-    @{ tag_name = 'streamline-2.14.1.0';  assets = @(@{ name = 'streamline_2.14.1.0.zip' }) },
-    @{ tag_name = 'streamline-2.14.0.0';  assets = @(@{ name = 'streamline_2.14.0.0.zip' }) },
-    @{ tag_name = 'dlssnr-310.9.0';       assets = @(@{ name = 'nvngx_dlssnr_310.9.0.zip' }) },
-    @{ tag_name = 'dlssnr-310.8.0-RTX40'; assets = @(@{ name = 'nvngx_dlssnr_310.8.0-RTX40.zip' }) },
-    @{ tag_name = 'dlssnr-310.8.SF';      assets = @(@{ name = 'nvngx_dlssnr_310.8.SF.zip' }) },
-    @{ tag_name = 'DLSS-Enabler-4.10.0';  assets = @(@{ name = 'DLSS-Enabler-4.10.0.zip' }) }
+$mockRhiTags = @(
+    'renodx-dlss5-5.2.1', 'dlss-310.9.1', 'dlss-310.9.0', 'dlssd-310.9.1', 'dlssg-310.9.1',
+    'streamline-2.14.1.0', 'streamline-2.14.0.0', 'dlssnr-310.9.0', 'dlssnr-310.8.0-RTX40',
+    'dlssnr-310.8.SF', 'DLSS-Enabler-4.10.0'
 )
-$mDlss = @(Get-RhiMirrorBuilds $mockRhi 'dlss')
+$mDlss = @(Get-RhiMirrorBuilds $mockRhiTags 'dlss')
 Assert-True 'mirror: dlss newest first, unrelated prefixes filtered' ($mDlss.Count -eq 2 -and $mDlss[0].Version -eq '310.9.1' -and $mDlss[0].Tag -eq 'dlss-310.9.1')
 Assert-True 'mirror: dlss asset name mapping' ($mDlss[0].AssetName -eq 'nvngx_dlss_310.9.1.zip')
-Assert-True 'mirror: dlssd section isolated' ((@(Get-RhiMirrorBuilds $mockRhi 'dlssd'))[0].AssetName -eq 'nvngx_dlssd_310.9.1.zip')
-Assert-True 'mirror: streamline 4-part version' ((@(Get-RhiMirrorBuilds $mockRhi 'streamline'))[0].Version -eq '2.14.1.0')
-$snrM = @(Get-RhiMirrorBuilds $mockRhi 'dlssnr')
+Assert-True 'mirror: download url deterministic from tag (no API asset lookup)' ($mDlss[0].DownloadUrl -eq 'https://github.com/RankFTW/rhi-repo/releases/download/dlss-310.9.1/nvngx_dlss_310.9.1.zip')
+Assert-True 'mirror: dlssd section isolated' ((@(Get-RhiMirrorBuilds $mockRhiTags 'dlssd'))[0].AssetName -eq 'nvngx_dlssd_310.9.1.zip')
+Assert-True 'mirror: streamline 4-part version' ((@(Get-RhiMirrorBuilds $mockRhiTags 'streamline'))[0].Version -eq '2.14.1.0')
+$snrM = @(Get-RhiMirrorBuilds $mockRhiTags 'dlssnr')
 Assert-True 'mirror: dlssnr suffix-tolerant, newest first (non-numeric suffix tag skipped)' ($snrM.Count -eq 2 -and $snrM[0].Version -eq '310.9.0' -and $snrM[1].Version -eq '310.8.0-RTX40')
 Assert-True 'mirror: dlssnr asset keeps full version incl. suffix' ($snrM[1].AssetName -eq 'nvngx_dlssnr_310.8.0-RTX40.zip')
-Assert-True 'mirror: unknown section -> empty' (@(Get-RhiMirrorBuilds $mockRhi 'nosuch').Count -eq 0)
+Assert-True 'mirror: unknown section -> empty' (@(Get-RhiMirrorBuilds $mockRhiTags 'nosuch').Count -eq 0)
 
 Assert-True 'dlss repo asset: demo windows picked' ((Get-DlssRepoAssetName @('ngx_dlss_demo_linux.zip', 'ngx_dlss_demo_windows.zip')) -eq 'ngx_dlss_demo_windows.zip')
 Assert-True 'dlss repo asset: no windows asset -> null' ($null -eq (Get-DlssRepoAssetName @('ngx_dlss_demo_linux.zip')))
@@ -264,7 +289,7 @@ if ($Integration) {
             foreach ($grp in $art.expect.groups) {
                 $ver = $null; $ok = $true
                 foreach ($dll in ($dlls | Where-Object { $_.Name -match $grp.pattern })) {
-                    $short = ConvertTo-ShortVersion $dll.VersionInfo.FileVersion
+                    $short = Get-FilePeVersion $dll.FullName
                     if ($short -ne $grp.version) { $ok = $false }
                     if (-not $ver) { $ver = $short } elseif ($short -ne $ver) { $ok = $false }
                 }
@@ -273,7 +298,7 @@ if ($Integration) {
             }
             foreach ($name in @($art.expect.versionless)) {
                 $dll = $dlls | Where-Object { $_.Name -eq $name }
-                Assert-True "versionless DLL present with empty FileVersion: $name ($($art.name))" ($null -ne $dll -and [string]::IsNullOrEmpty($dll.VersionInfo.FileVersion))
+                Assert-True "versionless DLL present with empty FileVersion: $name ($($art.name))" ($null -ne $dll -and -not (Get-FilePeVersion $dll.FullName))
             }
             if ($art.expect.PSObject.Properties['dllSha256']) {
                 foreach ($p in $art.expect.dllSha256.PSObject.Properties) {

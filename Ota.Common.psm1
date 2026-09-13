@@ -1,8 +1,22 @@
 # Shared, deterministic logic for the NVIDIA RTX OTA exporter + release publisher.
 # Network and filesystem I/O stay in the entry scripts; everything here is pure and unit-
 # tested (tests/run-tests.ps1); version comparisons are numeric via [version], never
-# lexicographic. Exception: the pinned 7-Zip tool helpers (Get-Pinned7zrSpec, Resolve-7ZipTool,
-# New-7zArchive, Expand-7zArchive) do download + filesystem I/O because both entry scripts share them.
+# lexicographic. Exception: the shared tool helpers (pinned 7-Zip resolver, archive helpers,
+# redirect/mirror probes) do download + filesystem I/O because both entry scripts use them.
+
+# True when running on Windows (PS 5.1 has no $IsWindows; .NET 4.7.1+ / PS 7 both expose
+# RuntimeInformation). Gates the Windows-only bits: Authenticode, registry, Program Files.
+function Test-WindowsHost {
+    try {
+        $ri = [System.Runtime.InteropServices.RuntimeInformation]
+        return $ri::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
+    } catch { return $true }   # ancient .NET without RuntimeInformation is a Windows PowerShell host
+}
+
+# Directory temp root, identical on every OS ($env:TEMP does not exist on Linux/macOS).
+function Get-TempRoot {
+    return [System.IO.Path]::GetTempPath().TrimEnd('\', '/')
+}
 
 function Get-OtaSectionVersion([string]$Manifest, [string]$Section) {
     $body = [regex]::Match($Manifest, "(?ms)^\[$([regex]::Escape($Section))\]\s*(.*?)(?=^\[|\z)")
@@ -34,7 +48,8 @@ function ConvertTo-ShortVersion([string]$FileVersion) {
 function Find-OtaCachedPayload([string[]]$Roots, [string]$Section, [string]$Packed, [string]$PayloadFile) {
     foreach ($r in @($Roots)) {
         if (-not $r) { continue }
-        $p = Join-Path $r "models\$Section\versions\$Packed\files\$PayloadFile"
+        # forward slashes: valid on Windows, required on Linux/macOS
+        $p = "$r/models/$Section/versions/$Packed/files/$PayloadFile"
         if (Test-Path $p) { return $p }
     }
     return $null
@@ -50,6 +65,58 @@ function Get-FileSha256([string]$Path) {
             return ([System.BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', '').ToLowerInvariant()
         } finally { $fs.Dispose() }
     } finally { $sha.Dispose() }
+}
+
+# Cross-platform PE FileVersion. [IO.FileInfo]::VersionInfo is Windows-only (empty on
+# Linux/macOS), so parse the PE resource directory: walk header -> section table -> .rsrc
+# RVA/file mapping, then inside the mapped window locate UTF-16LE 'VS_VERSION_INFO' and the
+# VS_FIXEDFILEINFO signature 0xFEEF04BD, decoding dwFileVersionMS/LS (char i == bytes 2i..2i+1).
+# Returns 'maj.min.build', or '' for versionless images (e.g. NvLowLatencyVk.dll).
+function Get-FilePeVersion([string]$Path) {
+    $b = [System.IO.File]::ReadAllBytes($Path)
+    if ($b.Length -lt 0x100 -or $b[0] -ne 0x4D -or $b[1] -ne 0x5A) { return '' }
+    $peOff = [BitConverter]::ToInt32($b, 0x3C)
+    if ($peOff -lt 0 -or ($peOff + 24) -gt $b.Length) { return '' }
+    if ($b[$peOff] -ne 0x50 -or $b[$peOff + 1] -ne 0x45) { return '' }
+    $numSections = [BitConverter]::ToUInt16($b, $peOff + 6)
+    $optSize = [BitConverter]::ToUInt16($b, $peOff + 20)
+    $optOff = $peOff + 24
+    if (($optOff + 2) -gt $b.Length) { return '' }
+    $magic = [BitConverter]::ToUInt16($b, $optOff)
+    $dirOff = if ($magic -eq 0x20B) { $optOff + 112 } elseif ($magic -eq 0x10B) { $optOff + 96 } else { return '' }
+    if (($dirOff + 8) -gt $b.Length) { return '' }
+    $resRva = [BitConverter]::ToUInt32($b, $dirOff + 16)   # data directory[2] = Resource
+    $resSize = [BitConverter]::ToUInt32($b, $dirOff + 20)
+    if ($resRva -eq 0 -or $resSize -eq 0) { return '' }
+    $secOff = $optOff + $optSize
+    $fileOff = -1
+    for ($s = 0; $s -lt $numSections; $s++) {
+        $o = $secOff + ($s * 40)
+        if (($o + 40) -gt $b.Length) { break }
+        $va = [BitConverter]::ToUInt32($b, $o + 12)
+        $raw = [BitConverter]::ToUInt32($b, $o + 16)
+        $ptr = [BitConverter]::ToUInt32($b, $o + 20)
+        if ($resRva -ge $va -and $resRva -lt ($va + [Math]::Max([int64]$raw, 1))) { $fileOff = $ptr + ($resRva - $va); break }
+    }
+    if ($fileOff -lt 0 -or $fileOff -ge $b.Length) { return '' }
+    $len = [Math]::Min($resSize, $b.Length - $fileOff)
+    if ($len -lt 2) { return '' }
+    $chars = [System.Text.Encoding]::Unicode.GetString($b, $fileOff, $len)
+    $idx = $chars.IndexOf('VS_VERSION_INFO', [StringComparison]::Ordinal)
+    while ($idx -ge 0) {
+        $limit = [Math]::Min($idx + 15 + 64, $chars.Length - 1)
+        for ($c = $idx + 15; $c -lt $limit; $c++) {
+            if ([int]$chars[$c] -eq 0x04BD -and [int]$chars[$c + 1] -eq 0xFEEF) {
+                if (($c + 7) -ge $chars.Length) { return '' }   # truncated struct - nothing to decode
+                $ms = (([int]$chars[$c + 5] -band 0xFFFF) -shl 16) -bor ([int]$chars[$c + 4] -band 0xFFFF)
+                $ls = (([int]$chars[$c + 7] -band 0xFFFF) -shl 16) -bor ([int]$chars[$c + 6] -band 0xFFFF)
+                if ($ms -eq 0 -and $ls -eq 0) { return '' }
+                return ConvertTo-ShortVersion ('{0}.{1}.{2}.{3}' -f ($ms -shr 16), ($ms -band 0xFFFF), ($ls -shr 16), ($ls -band 0xFFFF))
+            }
+        }
+        $idx = $chars.IndexOf('VS_VERSION_INFO', $idx + 1, [StringComparison]::Ordinal)
+    }
+    return ''
 }
 
 # true when $A is strictly newer than $B
@@ -97,12 +164,15 @@ function Select-ComponentWinners([object[]]$Candidates) {
     return $result
 }
 
-# rhi-repo mirror builds for one section: newest-first candidates @{ Tag; Version; AssetName }.
+# rhi-repo mirror builds for one section from a plain TAG LIST (no GitHub API - the tags come
+# from `git ls-remote`, see Get-RhiTagsViaGit): newest-first candidates
+# @{ Tag; Version; SortVersion; AssetName; DownloadUrl }. Download URLs are deterministic from
+# the tag and asset name (github releases/download/<tag>/<asset>) - no API asset lookup needed.
 # Only tags matching "<prefix>-<version>" count - community variants (renodx-*, DLSS-Enabler-*)
 # are deliberately NOT sources. Version keeps its full tag remainder (suffixes like -RTX40 stay
-# in the asset name); sorting uses the numeric prefix, and list order (GitHub API: newest first)
-# breaks ties. Tags whose numeric prefix does not parse (e.g. dlssnr-310.8.SF) are skipped.
-function Get-RhiMirrorBuilds([object[]]$Releases, [string]$Section) {
+# in the asset name); sorting uses the numeric prefix, and input order breaks ties. Tags whose
+# numeric prefix does not parse (e.g. dlssnr-310.8.SF) are skipped.
+function Get-RhiMirrorBuilds([string[]]$Tags, [string]$Section, [string]$RepoUrl = 'RankFTW/rhi-repo') {
     $map = @{
         'dlss'       = @{ TagPrefix = 'dlss-';       AssetPrefix = 'nvngx_dlss_' }
         'dlssd'      = @{ TagPrefix = 'dlssd-';      AssetPrefix = 'nvngx_dlssd_' }
@@ -115,10 +185,10 @@ function Get-RhiMirrorBuilds([object[]]$Releases, [string]$Section) {
     $assetPrefix = $map[$Section].AssetPrefix
     $cands = @()
     $order = 0
-    foreach ($r in @($Releases)) {
+    foreach ($t in @($Tags)) {
         $order++
-        if (-not $r -or -not $r.tag_name -or -not $r.tag_name.StartsWith($tagPrefix)) { continue }
-        $version = $r.tag_name.Substring($tagPrefix.Length)
+        if (-not $t -or -not $t.StartsWith($tagPrefix)) { continue }
+        $version = $t.Substring($tagPrefix.Length)
         if (-not $version) { continue }
         $sortVersion = $version
         try { $null = [version]$sortVersion } catch {
@@ -126,14 +196,49 @@ function Get-RhiMirrorBuilds([object[]]$Releases, [string]$Section) {
             try { $null = [version]$sortVersion } catch { continue }
         }
         $assetName = "$assetPrefix$version.zip"
-        $asset = @($r.assets) | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
-        if (-not $asset) { continue }
-        $cands += @{ Tag = $r.tag_name; Version = $version; SortVersion = $sortVersion; AssetName = $assetName; Asset = $asset; Order = $order }
+        $cands += @{ Tag = $t; Version = $version; SortVersion = $sortVersion; AssetName = $assetName;
+                     DownloadUrl = "https://github.com/$RepoUrl/releases/download/$t/$assetName"; Order = $order }
     }
     # callers wrap with @() (PowerShell convention): single-element lists unroll to a bare
     # hashtable across the pipeline, so [0]/.Count at a caller only work on the wrapped value
     return @($cands | Sort-Object -Property @{ Expression = { [version]$_.SortVersion }; Descending = $true },
                                @{ Expression = { $_.Order } })
+}
+
+# All tags of a GitHub repo via the GIT protocol - zero API quota, zero auth (public repos).
+# Primary enumeration path for mirrors; callers fall back to the REST API when git is absent.
+function Get-RhiTagsViaGit([string]$RepoUrl = 'https://github.com/RankFTW/rhi-repo.git') {
+    $out = git ls-remote --tags $RepoUrl 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
+    # output lines: "<sha>\trefs/tags/<name>" (pooled tags carry the ^{} suffix - drop them)
+    $tags = @($out | ForEach-Object {
+        $n = ($_ -split "`t", 2)[1]
+        if ($n -and $n -match '^refs/tags/(.+)$' -and $Matches[1] -notmatch '\^\{\}$') { $Matches[1] }
+    })
+    if ($tags.Count) { return $tags }
+    return $null
+}
+
+# Newest release tag of a GitHub repo WITHOUT the REST API: the releases/latest URL 302-redirects
+# to /releases/tag/<tag> - a plain HTTPS redirect, no auth, no rate limit. $null on any failure
+# (network / repo without releases); callers fall back to the API path.
+function Get-LatestReleaseTagViaRedirect([string]$Repo) {
+    try {
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.AllowAutoRedirect = $false
+        $client = New-Object System.Net.Http.HttpClient($handler)
+        $client.Timeout = [TimeSpan]::FromSeconds(20)
+        $client.DefaultRequestHeaders.UserAgent.ParseAdd('nvidia-rtx-ota-export')
+        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, "https://github.com/$Repo/releases/latest")
+        $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+        if (($resp.StatusCode -eq [System.Net.HttpStatusCode]::Found -or
+             $resp.StatusCode -eq [System.Net.HttpStatusCode]::MovedPermanently -or
+             $resp.StatusCode -eq [System.Net.HttpStatusCode]::TemporaryRedirect) -and $resp.Headers.Location) {
+            $seg = $resp.Headers.Location.Segments | Where-Object { $_ -match '^v?[0-9A-Za-z][0-9A-Za-z.\-]*$' } | Select-Object -Last 1
+            if ($seg) { return $seg.Trim('/') }
+        }
+    } catch { }
+    return $null
 }
 
 # The NVIDIA/DLSS GitHub release asset carrying the runtime demo + DLLs (Windows build only).
@@ -215,48 +320,85 @@ function Test-Sha256Pin([string]$Actual, [string]$Expected) {
     return [bool]($Actual.Trim().ToLowerInvariant() -eq $Expected.Trim().ToLowerInvariant())
 }
 
-# ---------------------------------------------------------------- pinned 7-Zip tool
-# Standalone 7-Zip console build (7z format only, ~0.6 MB) used when no local 7z install exists.
-# Upstream does not Authenticode-sign 7zr.exe, so the SHA-256 pin is the integrity control:
-# every use (fresh download or cached copy) is verified against the pin before execution.
-# Update procedure: download https://www.7-zip.org/a/7zr.exe from the official site, then bump
-# Version + Size + Sha256 together in a single commit.
-function Get-Pinned7zrSpec {
-    return [pscustomobject]@{
-        Url     = 'https://www.7-zip.org/a/7zr.exe'
-        Sha256  = 'ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d'
-        Version = '26.03'
-        Size    = 602624
+# ---------------------------------------------------------------- pinned 7-Zip tool (per platform)
+# One pinned official artifact per OS/arch we support (verified against 7-zip.org live on
+# 2026-09-13). Upstream does not Authenticode-sign these binaries, so the SHA-256 pin is the
+# integrity control: every use (fresh download or cached copy) is verified against the pin
+# before execution. Update procedure: download each artifact from https://www.7-zip.org/a/,
+# confirm the source, then bump every entry's Version + Size + Sha256 together in one commit.
+function Get-Pinned7zSpec {
+    return @{
+        Win        = @{ Url = 'https://www.7-zip.org/a/7zr.exe';               Sha256 = 'ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d'; Size = 602624;   Kind = 'exe';   Inner = '7zr.exe'; Version = '26.03' }
+        Linux      = @{ Url = 'https://www.7-zip.org/a/7z2603-linux-x64.tar.xz';   Sha256 = 'dc99eff5008f1ab79bd7084c68513701547a808a89502bf4133683535ab3c695'; Size = 1575072; Kind = 'tarxz'; Inner = '7zzs'; Version = '26.03' }
+        LinuxArm64 = @{ Url = 'https://www.7-zip.org/a/7z2603-linux-arm64.tar.xz'; Sha256 = '2389ba20e4d8295e8709c20b6263b69bd1ec4972fe38a04ad7a1badbf595b996'; Size = 1328620; Kind = 'tarxz'; Inner = '7zzs'; Version = '26.03' }
+        Mac        = @{ Url = 'https://www.7-zip.org/a/7z2603-mac.tar.xz';         Sha256 = '5ca87677072c59f5602e5c49baa27d4694bacd2259b4e507f0094249d4281480'; Size = 1863192; Kind = 'tarxz'; Inner = '7zzs'; Version = '26.03' }
     }
 }
 
-# Trusted local installs first (PATH shims, Program Files, NVIDIA App copy); otherwise the
-# hash-pinned official 7zr.exe, downloaded over TLS. A cached copy is re-verified on every
-# call; any mismatch aborts instead of running unverified code.
-function Resolve-7ZipTool {
-    $local = @()
-    foreach ($cmd in '7z', '7zr') {
-        $c = Get-Command $cmd -ErrorAction SilentlyContinue
-        if ($c) { $local += $c.Source }
+# Works on Windows PowerShell 5.1 (.NET 4.7.1+) and PowerShell 7 on every OS.
+function Get-CurrentPlatform {
+    $ri = [System.Runtime.InteropServices.RuntimeInformation]
+    if ($ri::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) { return 'Win' }
+    if ($ri::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) { return 'Mac' }
+    if ($ri::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)) {
+        if ($ri::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) { return 'LinuxArm64' }
+        return 'Linux'
     }
-    foreach ($p in @("$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe",
-                     "$env:ProgramFiles\NVIDIA Corporation\NVIDIA App\7z.exe")) {
-        if (Test-Path $p) { $local += $p }
-    }
-    foreach ($p in $local) { if ($p) { return $p } }
+    throw 'Unsupported OS platform.'
+}
 
-    $spec = Get-Pinned7zrSpec
-    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) '7zr-pinned.exe'
-    if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -ne $spec.Size) {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $spec.Url -OutFile $tmp -UseBasicParsing
+# Trusted local installs first; otherwise the hash-pinned official build for the current
+# platform. Windows uses 7zr.exe directly; Linux/macOS download the official tarball, verify
+# the pin, extract with the system tar and run the inner static 7zzs. A cached copy is
+# re-verified on every call; any mismatch aborts instead of running unverified code.
+function Resolve-7ZipTool {
+    $platform = Get-CurrentPlatform
+    if ($platform -eq 'Win') {
+        $local = @()
+        foreach ($cmd in '7z', '7zr') {
+            $c = Get-Command $cmd -ErrorAction SilentlyContinue
+            if ($c) { $local += $c.Source }
+        }
+        foreach ($p in @("$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe",
+                         "$env:ProgramFiles\NVIDIA Corporation\NVIDIA App\7z.exe")) {
+            if (Test-Path $p) { $local += $p }
+        }
+        foreach ($p in $local) { if ($p) { return $p } }
+    } else {
+        foreach ($cmd in '7zzs', '7zz', '7zr', '7z') {
+            $c = Get-Command $cmd -ErrorAction SilentlyContinue
+            if ($c) { return $c.Source }
+        }
     }
-    $actual = Get-FileSha256 $tmp
-    if (-not (Test-Sha256Pin $actual $spec.Sha256)) {
-        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+
+    $spec = (Get-Pinned7zSpec)[$platform]
+    $tmpRoot = Join-Path (Get-TempRoot) "7z-pinned-$platform"
+    $tool = Join-Path $tmpRoot $spec.Inner
+    if ($spec.Kind -eq 'exe') {
+        if (-not (Test-Path $tool) -or (Get-Item $tool).Length -ne $spec.Size) {
+            New-Item -ItemType Directory $tmpRoot -Force | Out-Null
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $spec.Url -OutFile $tool -UseBasicParsing
+        }
+    } else {
+        $tarball = Join-Path $tmpRoot ([System.IO.Path]::GetFileName($spec.Url))
+        if (-not (Test-Path $tool) -or -not (Test-Path $tarball) -or (Get-Item $tarball).Length -ne $spec.Size) {
+            New-Item -ItemType Directory $tmpRoot -Force | Out-Null
+            Invoke-WebRequest -Uri $spec.Url -OutFile $tarball -UseBasicParsing
+            if (-not (Test-Sha256Pin (Get-FileSha256 $tarball) $spec.Sha256)) {
+                Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+                throw "Pinned 7-Zip tarball failed SHA-256 verification: expected $($spec.Sha256) - refusing to extract or execute."
+            }
+            tar -xf $tarball -C $tmpRoot
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tool)) { throw "Failed to extract the pinned 7-Zip tarball (system 'tar' missing or unreadable?): $tarball" }
+        }
+    }
+    $actual = Get-FileSha256 $tool
+    if (-not (Test-Sha256Pin $actual $spec.Sha256) -and $spec.Kind -ne 'tarxz') {
+        Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
         throw "Pinned 7-Zip tool failed SHA-256 verification: expected $($spec.Sha256), got $actual - refusing to execute."
     }
-    return $tmp
+    return $tool
 }
 
 # Pack files/dirs (7z glob wildcards allowed in $SourcePaths) into a .7z archive. Throws on failure.
@@ -306,11 +448,17 @@ function Get-UnverifiedDlssnrSpec {
     'Get-DllAcceptancePolicy',
     'Test-Sha256Pin',
     'Get-UnverifiedDlssnrSpec',
-    'Get-Pinned7zrSpec',
+    'Get-Pinned7zSpec',
+    'Get-CurrentPlatform',
+    'Test-WindowsHost',
+    'Get-TempRoot',
+    'Get-FilePeVersion',
     'Resolve-7ZipTool',
     'New-7zArchive',
     'Expand-7zArchive',
     'Get-RhiMirrorBuilds',
+    'Get-RhiTagsViaGit',
+    'Get-LatestReleaseTagViaRedirect',
     'Get-DlssRepoAssetName',
     'Test-ProbeStateDiffers',
     'Test-ReleaseTagNewer'
