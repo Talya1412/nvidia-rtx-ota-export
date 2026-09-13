@@ -23,6 +23,75 @@ foreach ($f in 'Export-RtxOtaPreRelease.ps1', 'New-OtaRelease.ps1') {
     Assert-True "syntax clean: $f" ($errs.Count -eq 0)
 }
 
+# ---------------------------------------------------------------- sl_sdk_0 base set + host re-invocation (behavioral)
+function New-TestZip([string]$Path, [string[]]$EntryNames) {
+    $zip = [System.IO.Compression.ZipFile]::Open($Path, 'Create')
+    try {
+        foreach ($name in $EntryNames) {
+            $entry = $zip.CreateEntry($name)
+            $stream = $entry.Open()
+            try {
+                $bytes = [byte[]]@(1, 2, 3)
+                $stream.Write($bytes, 0, $bytes.Length)
+            } finally {
+                $stream.Dispose()
+            }
+        }
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+$slSdkTestRoot = Join-Path (Get-TempRoot) ('ota-sl-sdk-' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $slSdkTestRoot -Force | Out-Null
+
+    $zipA = Join-Path $slSdkTestRoot 'case-a.zip'
+    $destA = Join-Path $slSdkTestRoot 'case-a'
+    New-TestZip $zipA @('160_E658703/sl.common.dll', '160_E658703/sl.dlss.dll', '160_E658703/readme.txt')
+    $resultA = Expand-SlSdkPayload $zipA $destA
+    Assert-True 'sl_sdk_0: top-level DLLs extracted mark base set ready' ($resultA -eq $true)
+    Assert-True 'sl_sdk_0: sl.common.dll extracted' (Test-Path (Join-Path $destA 'sl.common.dll'))
+    Assert-True 'sl_sdk_0: sl.dlss.dll extracted' (Test-Path (Join-Path $destA 'sl.dlss.dll'))
+    Assert-True 'sl_sdk_0: non-DLL payload entry is not extracted' (-not (Test-Path (Join-Path $destA 'readme.txt')))
+
+    $zipB = Join-Path $slSdkTestRoot 'case-b.zip'
+    $destB = Join-Path $slSdkTestRoot 'case-b'
+    New-TestZip $zipB @('160_E658703/bin/sl.common.dll')
+    $resultB = Expand-SlSdkPayload $zipB $destB
+    Assert-True 'sl_sdk_0: nested-only payload leaves base set NOT ready (bundle fallback stays reachable)' ($resultB -eq $false)
+    Assert-True 'sl_sdk_0: nested-only payload extracts no DLLs' (@(Get-ChildItem $destB -Filter '*.dll' -File).Count -eq 0)
+
+    $zipD = Join-Path $slSdkTestRoot 'case-d.zip'
+    $destD = Join-Path $slSdkTestRoot 'case-d'
+    New-Item -ItemType Directory -Path $destD -Force | Out-Null
+    Set-Content -Path (Join-Path $destD 'sl.common.dll') -Value 'pre-existing' -NoNewline
+    New-TestZip $zipD @('160_E658703/bin/sl.common.dll')
+    $resultD = Expand-SlSdkPayload $zipD $destD
+    Assert-True 'sl_sdk_0: pre-existing sl.common.dll in destination does not count as ready' ($resultD -eq $false)
+
+    $zipC = Join-Path $slSdkTestRoot 'case-c.zip'
+    $destC = Join-Path $slSdkTestRoot 'case-c'
+    New-TestZip $zipC @('other/sl.common.dll')
+    $resultC = Expand-SlSdkPayload $zipC $destC
+    Assert-True 'sl_sdk_0: wrong-prefix payload leaves base set NOT ready' ($resultC -eq $false)
+
+    $zipE = Join-Path $slSdkTestRoot 'case-e.zip'
+    $destE = Join-Path $slSdkTestRoot 'case-e'
+    New-TestZip $zipE @('160_E658703/..\evil.dll', '160_E658703/../evil2.dll')
+    $resultE = Expand-SlSdkPayload $zipE $destE
+    $destParent = Split-Path -Parent $destE
+    Assert-True 'zip-slip: traversal entries are skipped and nothing lands outside dest' ($resultE -eq $false -and -not (Test-Path (Join-Path $destE 'evil.dll')) -and -not (Test-Path (Join-Path $destParent 'evil.dll')))
+
+    $hostPath = Get-PowerShellHostPath
+    Assert-True 'host: resolved path is non-empty' (-not [string]::IsNullOrWhiteSpace($hostPath))
+    Assert-True 'host: resolved path launches and reports the same PSEdition' ((& $hostPath -NoProfile -NonInteractive -Command '$PSVersionTable.PSEdition').Trim() -eq $PSVersionTable.PSEdition)
+    Assert-True 'host: Core edition never resolves to Windows PowerShell' ($PSVersionTable.PSEdition -ne 'Core' -or ((Split-Path -Leaf $hostPath) -notmatch '^powershell(\.exe)?$'))
+    Assert-True 'host: resolved executable is pwsh or powershell' ((Split-Path -Leaf $hostPath) -match '^(pwsh|powershell)(\.exe)?$')
+} finally {
+    Remove-Item $slSdkTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # ---------------------------------------------------------------- fixtures
 $staging3109 = @'
 [dlss]

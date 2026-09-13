@@ -137,7 +137,8 @@ $probeLive | ConvertTo-Json | Set-Content $probeStatePath -Encoding UTF8
 
 Write-Host '==> Exporting current newest state' -ForegroundColor Cyan
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("nvngx-release-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
-powershell -NoProfile -ExecutionPolicy Bypass -File $exportScript -OutDir $work -Channel $Channel
+$psExe = Get-PowerShellHostPath
+& $psExe -NoProfile -ExecutionPolicy Bypass -File $exportScript -OutDir $work -Channel $Channel
 if ($LASTEXITCODE -ne 0) { throw 'Export step failed.' }
 $sourcesFile = Join-Path $work 'export-sources.txt'
 $dlssSource = 'unknown'; $slSource = 'unknown'; $feedState = @{}
