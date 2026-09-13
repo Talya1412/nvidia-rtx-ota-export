@@ -407,7 +407,8 @@ if ($winners.SlSource -eq 'sdk-streamline') {
         if (-not (Test-SidecarSha256 $tmpSlsdkZip "$slsdkUrl.sha256")) { throw 'sl_sdk_0 payload failed SHA-256 sidecar verification.' }
         # payload entries live under the 160_E658703/ subdirectory (like the SDK zip's bin/x64)
         Expand-ZipSubset $tmpSlsdkZip '160_E658703' $OutDir
-        $baseReady = $true
+        $baseReady = Test-Path (Join-Path $OutDir 'sl.common.dll')
+        if (-not $baseReady) { throw 'sl_sdk_0 payload contained no sl.common.dll under 160_E658703/.' }
         Write-Info "$baseChannel sl_sdk_0 payload extracted (SL $slPin, sidecar-verified)."
     } catch {
         Write-Warn2 "$baseChannel sl_sdk_0 payload unavailable: $($_.Exception.Message) - falling back to the dlss_override bundle."

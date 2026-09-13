@@ -22,7 +22,7 @@ foreach ($f in 'Export-RtxOtaPreRelease.ps1', 'New-OtaRelease.ps1') {
     [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot $f), [ref]$null, [ref]$errs)
     Assert-True "syntax clean: $f" ($errs.Count -eq 0)
 }
-Assert-True 'export: sl_sdk_0 success marks base set ready' ((Get-Content (Join-Path $repoRoot 'Export-RtxOtaPreRelease.ps1') -Raw) -match '\$baseReady\s*=\s*\$true')
+Assert-True 'export: sl_sdk_0 success marks base set ready' ((Get-Content (Join-Path $repoRoot 'Export-RtxOtaPreRelease.ps1') -Raw) -match '\$baseReady\s*=\s*Test-Path')
 Assert-True 'release: export invoked via current host, not hardcoded powershell' (((Get-Content (Join-Path $repoRoot 'New-OtaRelease.ps1') -Raw) -notmatch '(?m)^\s*powershell\s+-NoProfile'))
 
 # ---------------------------------------------------------------- fixtures
