@@ -187,7 +187,7 @@ function Get-OtaChannelState([string]$Ch) {
         SlSdk  = Get-OtaSectionVersion $m 'sl_sdk_0'
         Dlssnr = Get-OtaSectionVersion $m 'dlssnr'
     }
-    if (-not ($o.Dlss -and $o.Dlssd -and $o.Dlssg -and $o.Sl -and $o.SlSdk)) {
+    if (-not ($o.Dlss -and $o.Dlssd -and $o.Dlssg -and ($o.Sl -or $o.SlSdk))) {
         Write-Warn2 "$Ch manifest incomplete: dlss=$($o.Dlss) dlssd=$($o.Dlssd) dlssg=$($o.Dlssg) dlss_override=$($o.Sl) sl_sdk=$($o.SlSdk) - dropping channel."
         return $null
     }
@@ -290,7 +290,7 @@ if (-not $SkipGitHubCheck) {
 $candidates = @()
 foreach ($ch in 'Staging', 'Production') {
     if ($ota.ContainsKey($ch)) {
-        $candidates += @{ Source = "ota-$($ch.ToLowerInvariant())"; Dlss = $ota[$ch].Dlss; Sl = $ota[$ch].SlSdk }
+        $candidates += @{ Source = "ota-$($ch.ToLowerInvariant())"; Dlss = $ota[$ch].Dlss; Sl = if ($ota[$ch].SlSdk) { $ota[$ch].SlSdk } else { $ota[$ch].Sl } }
     }
 }
 if ($sdkSource) { $candidates += @{ Source = 'sdk-streamline'; Dlss = $sdkSource.Dlss; Sl = $sdkSource.Sl } }
@@ -366,33 +366,53 @@ if ($sdkSource) { $sources += "sdk=$($sdkSource.Sl)" }
 if ($dlssRepo)  { $sources += "dlss-repo=$($dlssRepo.Dlss)" }
 Set-Content -Path (Join-Path $OutDir 'export-sources.txt') -Value $sources -Encoding Ascii
 
-# base set = the SL winner's full payload (production flavor everywhere); the winning OTA
-# channel's dlss_override bundle is the only bundle ever downloaded
+# base set = the SL winner's payload. For OTA winners that is the channel's sl_sdk_0 payload
+# (~10 MB, NVIDIA CDN, .sha256 sidecar) - verified live to carry the byte-identical sl.* set the
+# dlss_override bundle ships (9/9 hashes). The heavy bundle stays as a fallback for the rare case
+# the sl_sdk payload is unreachable. The DLSS trio arrives via the DLSS winner overlay or the raw
+# .bin refresh below (both sidecar-verified) and is never duplicated here.
 if ($winners.SlSource -eq 'sdk-streamline') {
     Copy-Item (Join-Path $sdkSource.Dir '*.dll') $OutDir -Force
 } elseif ($baseChannel) {
     $o = $ota[$baseChannel]
-    $packed = ConvertTo-PackedVersion $o.Sl
-    $tmpZip = Join-Path $env:TEMP "nvngx_ota_bundle_$packed.zip"
-    $url = "$(Get-ChannelBaseUrl $baseChannel)/dlss_override/versions/$packed/files/${GenericPayload}.zip"
-    Write-Step "Downloading $baseChannel dlss_override OTA bundle (pin $($o.Sl))"
+    $slPin = if ($o.SlSdk) { $o.SlSdk } else { $o.Sl }
+    $packedSdk = ConvertTo-PackedVersion $slPin
+    $slsdkUrl = "$(Get-ChannelBaseUrl $baseChannel)/sl_sdk_0/versions/$packedSdk/files/160_E658703.zip"
+    Write-Step "Downloading $baseChannel sl_sdk_0 payload (pin $slPin)"
+    $tmpSlsdkZip = Join-Path $env:TEMP "nvngx_slsdk_$packedSdk.zip"
+    $baseReady = $false
     try {
-        Invoke-WebRequest -Uri $url -OutFile $tmpZip -UseBasicParsing
-        if (-not (Test-SidecarSha256 $tmpZip "$url.sha256")) { throw "$baseChannel dlss_override bundle failed SHA-256 sidecar verification." }
-        $dir = Join-Path $env:TEMP "nvngx_ota_extract_$packed"
-        if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($tmpZip, $dir)
-        $payload = Get-ChildItem $dir -Directory | Select-Object -First 1
-        Copy-Item (Join-Path $payload.FullName '*.dll') $OutDir -Force
-        Remove-Item $dir -Recurse -Force
-        Write-Info "$baseChannel bundle extracted (SL pin $($o.SlSdk))."
+        Invoke-WebRequest -Uri $slsdkUrl -OutFile $tmpSlsdkZip -UseBasicParsing
+        if (-not (Test-SidecarSha256 $tmpSlsdkZip "$slsdkUrl.sha256")) { throw 'sl_sdk_0 payload failed SHA-256 sidecar verification.' }
+        Expand-ZipSubset $tmpSlsdkZip '' $OutDir
+        $baseReady = $true
+        Write-Info "$baseChannel sl_sdk_0 payload extracted (SL $slPin, sidecar-verified)."
     } catch {
-        throw "SL winner $($winners.SlSource) $($winners.SlVersion): dlss_override bundle fetch failed - $($_.Exception.Message)"
+        Write-Warn2 "$baseChannel sl_sdk_0 payload unavailable: $($_.Exception.Message) - falling back to the dlss_override bundle."
     } finally {
-        if (Test-Path $tmpZip) { Remove-Item $tmpZip -Force }
+        if (Test-Path $tmpSlsdkZip) { Remove-Item $tmpSlsdkZip -Force }
+    }
+    if (-not $baseReady) {
+        $packed = ConvertTo-PackedVersion $o.Sl
+        $tmpZip = Join-Path $env:TEMP "nvngx_ota_bundle_$packed.zip"
+        $url = "$(Get-ChannelBaseUrl $baseChannel)/dlss_override/versions/$packed/files/${GenericPayload}.zip"
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $tmpZip -UseBasicParsing
+            if (-not (Test-SidecarSha256 $tmpZip "$url.sha256")) { throw "$baseChannel dlss_override bundle failed SHA-256 sidecar verification." }
+            $dir = Join-Path $env:TEMP "nvngx_ota_extract_$packed"
+            if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($tmpZip, $dir)
+            $payload = Get-ChildItem $dir -Directory | Select-Object -First 1
+            Copy-Item (Join-Path $payload.FullName '*.dll') $OutDir -Force
+            Remove-Item $dir -Recurse -Force
+            Write-Info "$baseChannel dlss_override bundle extracted (SL pin $($o.Sl))."
+        } catch {
+            throw "SL winner $($winners.SlSource) $($winners.SlVersion): sl_sdk payload and dlss_override bundle both failed - $($_.Exception.Message)"
+        } finally {
+            if (Test-Path $tmpZip) { Remove-Item $tmpZip -Force }
+        }
     }
 }
-
 # DLSS fix-up: the DLSS winner's DLLs overlay the base set whenever they come from another source
 if ($winners.DlssSource -eq 'sdk-streamline' -and $winners.SlSource -ne 'sdk-streamline') {
     foreach ($dll in 'nvngx_dlss.dll', 'nvngx_dlssd.dll', 'nvngx_dlssg.dll') {

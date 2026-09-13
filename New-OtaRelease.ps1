@@ -117,7 +117,10 @@ try {
     }
 } catch { Write-Host '    ! probe state unavailable (will export)' -ForegroundColor Yellow }
 
-if (-not (Test-ProbeStateDiffers $probeLive $storedProbe)) {
+# fail-open: an unhealthy probe (manifests unreachable) must NEVER skip the export - otherwise a
+# down CDN could freeze the pipeline on a stale "no change" verdict while feeds move on
+$probeHealthy = [bool]($probeLive.stagingDlss -or $probeLive.productionDlss)
+if ($probeHealthy -and -not (Test-ProbeStateDiffers $probeLive $storedProbe)) {
     Write-Host "==> No feed changed since $newestRelTag. Nothing to do." -ForegroundColor Green
     exit 0
 }

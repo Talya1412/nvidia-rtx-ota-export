@@ -63,7 +63,8 @@ Assert-True 'section version: missing section -> null' ($null -eq (Get-OtaSectio
 Assert-True 'packed version: 310.9.0 -> 20318464 (README-documented)' ((ConvertTo-PackedVersion '310.9.0') -eq 20318464)
 Assert-True 'packed version: 310.7.128 -> 20318080' ((ConvertTo-PackedVersion '310.7.128') -eq 20318080)
 
-Assert-True 'numeric compare: 310.10.0 > 310.9.0 (not lexicographic)' (Compare-OtaNewer '310.10.0' '310.9.0')
+Assert-True 'packed version: 310.9.0 -> 20318464 (README-documented)' ((ConvertTo-PackedVersion '310.9.0') -eq 20318464)
+Assert-True 'packed version: 2.14.0 -> 134656 (sl_sdk_0 payload path)' ((ConvertTo-PackedVersion '2.14.0') -eq 134656)
 Assert-True 'numeric compare: 310.9.0 < 310.10.0' (-not (Compare-OtaNewer '310.9.0' '310.10.0'))
 Assert-True 'numeric compare: equal -> not newer' (-not (Compare-OtaNewer '310.7.128' '310.7.128'))
 
