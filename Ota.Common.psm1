@@ -421,33 +421,41 @@ function Expand-7zArchive([string]$ArchivePath, [string]$DestDir) {
     if ($LASTEXITCODE -ne 0) { throw "7z extraction failed (exit $LASTEXITCODE): $ArchivePath" }
 }
 
+# Extracts only top-level *.dll entries under EntryPrefix; path separators / '..' in the remainder are rejected (zip-slip). Returns the extracted file names.
 function Expand-ZipSubset([string]$ZipPath, [string]$EntryPrefix, [string]$DestDir) {
     New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+    $destFull = [System.IO.Path]::GetFullPath((Resolve-Path $DestDir).ProviderPath).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
     $prefix = if ($EntryPrefix) { $EntryPrefix.Trim('/') + '/' } else { '' }
+    $extracted = New-Object System.Collections.Generic.List[string]
     $z = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
     try {
         foreach ($e in $z.Entries) {
             if (-not $e.FullName.StartsWith($prefix)) { continue }
             $rest = $e.FullName.Substring($prefix.Length)
-            if ($rest.Contains('/') -or -not $rest.EndsWith('.dll')) { continue }
-            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path $DestDir $rest), $true)
+            if ($rest.Contains('/') -or $rest.Contains('\') -or $rest.Contains('..') -or -not $rest.EndsWith('.dll')) { continue }
+            $target = [System.IO.Path]::GetFullPath((Join-Path $destFull $rest))
+            if (-not $target.StartsWith($destFull, [System.StringComparison]::OrdinalIgnoreCase)) { throw "zip entry escapes destination: $($e.FullName)" }
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $target, $true)
+            $extracted.Add($rest)
         }
     } finally { $z.Dispose() }
+    return ,[string[]]$extracted.ToArray()
 }
 
 # Extract the sl_sdk_0 payload's top-level DLLs and report whether a usable Streamline base
 # set came out; a verified archive whose DLLs sit deeper than the expected prefix yields $false
 # so the caller can fall back to the dlss_override bundle.
 function Expand-SlSdkPayload([string]$ZipPath, [string]$DestDir, [string]$EntryPrefix = '160_E658703') {
-    Expand-ZipSubset $ZipPath $EntryPrefix $DestDir
-    return [bool](Test-Path (Join-Path $DestDir 'sl.common.dll'))
+    $extracted = @(Expand-ZipSubset $ZipPath $EntryPrefix $DestDir | ForEach-Object { $_ })
+    return [bool]($extracted -contains 'sl.common.dll')
 }
 
 # Path of the PowerShell host running this script (pwsh or powershell.exe), so child scripts
-# are re-invoked under the same host instead of a hardcoded `powershell`.
+# are re-invoked under the same host; editors/embedded hosts (e.g. powershell_ise.exe) fall
+# back to the console host by edition.
 function Get-PowerShellHostPath {
     $p = (Get-Process -Id $PID).Path
-    if ($p) { return $p }
+    if ($p -and ((Split-Path -Leaf $p) -match '^(pwsh|powershell)(\.exe)?$')) { return $p }
     if ($PSVersionTable.PSEdition -eq 'Core') { return 'pwsh' } else { return 'powershell' }
 }
 

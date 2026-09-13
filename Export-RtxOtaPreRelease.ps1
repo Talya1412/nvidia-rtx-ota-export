@@ -228,7 +228,7 @@ if ($wantSdk) {
         $tmpSdkDir = Join-Path (Get-TempRoot) 'streamline-sdk-latest'
         if (Test-Path $tmpSdkDir) { Remove-Item $tmpSdkDir -Recurse -Force }
         Invoke-WebRequest -Uri $sdkUrl -OutFile $tmpSdkZip -UseBasicParsing
-        Expand-ZipSubset $tmpSdkZip 'bin/x64' $tmpSdkDir
+        Expand-ZipSubset $tmpSdkZip 'bin/x64' $tmpSdkDir | Out-Null
         Remove-Item $tmpSdkZip -Force
         $sdkSource = @{
             Tag  = $sdkTag
@@ -256,7 +256,7 @@ if ($wantDlssRepo) {
         $tmpDemoDir = Join-Path (Get-TempRoot) 'dlss-demo-latest'
         if (Test-Path $tmpDemoDir) { Remove-Item $tmpDemoDir -Recurse -Force }
         Invoke-WebRequest -Uri $demoUrl -OutFile $tmpDemoZip -UseBasicParsing
-        Expand-ZipSubset $tmpDemoZip 'DLSS_Sample_App/bin/ngx_dlss_demo' $tmpDemoDir
+        Expand-ZipSubset $tmpDemoZip 'DLSS_Sample_App/bin/ngx_dlss_demo' $tmpDemoDir | Out-Null
         Remove-Item $tmpDemoZip -Force
         $dlssRepo = @{
             Tag  = $dlssTag
@@ -330,7 +330,7 @@ function Get-MirrorDll([object[]]$Candidates, [string]$DllName, [string]$Trusted
         $tmpDir = Join-Path (Get-TempRoot) "mirror-$($cand.Tag)"
         try {
             Invoke-WebRequest -Uri $cand.DownloadUrl -OutFile $tmpZip -UseBasicParsing
-            Expand-ZipSubset $tmpZip '' $tmpDir
+            Expand-ZipSubset $tmpZip '' $tmpDir | Out-Null
             $dll = Join-Path $tmpDir $DllName
             if (-not (Test-Path $dll)) {
                 Write-Warn2 "mirror $($cand.Tag): $DllName missing in archive."
@@ -520,7 +520,7 @@ if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
         try {
             $sourceUrl = if ($cand.Kind -eq 'pinned') { $cand.Spec.Url } else { $cand.Cand.DownloadUrl }
             Invoke-WebRequest -Uri $sourceUrl -OutFile $tmpZip -UseBasicParsing
-            if ($cand.Kind -eq 'pinned') { Expand-7zArchive $tmpZip $tmpDir } else { Expand-ZipSubset $tmpZip '' $tmpDir }
+            if ($cand.Kind -eq 'pinned') { Expand-7zArchive $tmpZip $tmpDir } else { Expand-ZipSubset $tmpZip '' $tmpDir | Out-Null }
             $snrDll = Join-Path $tmpDir 'nvngx_dlssnr.dll'
             if (-not (Test-Path $snrDll)) { throw 'nvngx_dlssnr.dll missing in archive' }
             $snrHash = Get-FileSha256 $snrDll
