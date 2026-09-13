@@ -210,20 +210,6 @@ function Get-OtaChannelState([string]$Ch) {
     return $o
 }
 
-function Expand-ZipSubset([string]$ZipPath, [string]$EntryPrefix, [string]$DestDir) {
-    New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
-    $prefix = if ($EntryPrefix) { $EntryPrefix.Trim('/') + '/' } else { '' }
-    $z = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
-    try {
-        foreach ($e in $z.Entries) {
-            if (-not $e.FullName.StartsWith($prefix)) { continue }
-            $rest = $e.FullName.Substring($prefix.Length)
-            if ($rest.Contains('/') -or -not $rest.EndsWith('.dll')) { continue }
-            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path $DestDir $rest), $true)
-        }
-    } finally { $z.Dispose() }
-}
-
 $ota = @{}
 if ($wantStaging)    { $s = Get-OtaChannelState 'Staging';    if ($s) { $ota['Staging'] = $s } }
 if ($wantProduction) { $s = Get-OtaChannelState 'Production'; if ($s) { $ota['Production'] = $s } }
@@ -406,8 +392,7 @@ if ($winners.SlSource -eq 'sdk-streamline') {
         Invoke-WebRequest -Uri $slsdkUrl -OutFile $tmpSlsdkZip -UseBasicParsing
         if (-not (Test-SidecarSha256 $tmpSlsdkZip "$slsdkUrl.sha256")) { throw 'sl_sdk_0 payload failed SHA-256 sidecar verification.' }
         # payload entries live under the 160_E658703/ subdirectory (like the SDK zip's bin/x64)
-        Expand-ZipSubset $tmpSlsdkZip '160_E658703' $OutDir
-        $baseReady = Test-Path (Join-Path $OutDir 'sl.common.dll')
+        $baseReady = Expand-SlSdkPayload $tmpSlsdkZip $OutDir
         if (-not $baseReady) { throw 'sl_sdk_0 payload contained no sl.common.dll under 160_E658703/.' }
         Write-Info "$baseChannel sl_sdk_0 payload extracted (SL $slPin, sidecar-verified)."
     } catch {

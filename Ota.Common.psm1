@@ -4,6 +4,8 @@
 # lexicographic. Exception: the shared tool helpers (pinned 7-Zip resolver, archive helpers,
 # redirect/mirror probes) do download + filesystem I/O because both entry scripts use them.
 
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
 # True when running on Windows (PS 5.1 has no $IsWindows; .NET 4.7.1+ / PS 7 both expose
 # RuntimeInformation). Gates the Windows-only bits: Authenticode, registry, Program Files.
 function Test-WindowsHost {
@@ -419,6 +421,36 @@ function Expand-7zArchive([string]$ArchivePath, [string]$DestDir) {
     if ($LASTEXITCODE -ne 0) { throw "7z extraction failed (exit $LASTEXITCODE): $ArchivePath" }
 }
 
+function Expand-ZipSubset([string]$ZipPath, [string]$EntryPrefix, [string]$DestDir) {
+    New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+    $prefix = if ($EntryPrefix) { $EntryPrefix.Trim('/') + '/' } else { '' }
+    $z = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($e in $z.Entries) {
+            if (-not $e.FullName.StartsWith($prefix)) { continue }
+            $rest = $e.FullName.Substring($prefix.Length)
+            if ($rest.Contains('/') -or -not $rest.EndsWith('.dll')) { continue }
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path $DestDir $rest), $true)
+        }
+    } finally { $z.Dispose() }
+}
+
+# Extract the sl_sdk_0 payload's top-level DLLs and report whether a usable Streamline base
+# set came out; a verified archive whose DLLs sit deeper than the expected prefix yields $false
+# so the caller can fall back to the dlss_override bundle.
+function Expand-SlSdkPayload([string]$ZipPath, [string]$DestDir, [string]$EntryPrefix = '160_E658703') {
+    Expand-ZipSubset $ZipPath $EntryPrefix $DestDir
+    return [bool](Test-Path (Join-Path $DestDir 'sl.common.dll'))
+}
+
+# Path of the PowerShell host running this script (pwsh or powershell.exe), so child scripts
+# are re-invoked under the same host instead of a hardcoded `powershell`.
+function Get-PowerShellHostPath {
+    $p = (Get-Process -Id $PID).Path
+    if ($p) { return $p }
+    if ($PSVersionTable.PSEdition -eq 'Core') { return 'pwsh' } else { return 'powershell' }
+}
+
 # Deliberately selected universal dlssnr artifact supplied by the user. Plain asset name; the
 # UNVERIFIED Authenticode status is documented in release notes, not the filename. The URL is
 # fetchable by CI; the DLL hash is immutable - an UNVERIFIED exception, never a blanket
@@ -456,6 +488,9 @@ function Get-UnverifiedDlssnrSpec {
     'Resolve-7ZipTool',
     'New-7zArchive',
     'Expand-7zArchive',
+    'Expand-ZipSubset',
+    'Expand-SlSdkPayload',
+    'Get-PowerShellHostPath',
     'Get-RhiMirrorBuilds',
     'Get-RhiTagsViaGit',
     'Get-LatestReleaseTagViaRedirect',
