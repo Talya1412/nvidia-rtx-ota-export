@@ -70,24 +70,90 @@ function Select-DlssnrBuild([object[]]$Candidates) {
     return $best
 }
 
-# Per-component newest across sources. Candidates: @{ Source; Dlss; Sl }. Picks the DLSS winner
-# and the SL winner independently (numeric compare). Ties prefer the official Streamline SDK
-# (GitHub) over OTA staging over OTA production.
+# Per-component newest across sources. Candidates: @{ Source; Dlss; Sl } where $Sl may be $null
+# (DLSS-only sources, e.g. the NVIDIA/DLSS GitHub demo) - they race for DLSS only, never SL.
+# Each winner picked independently (numeric compare). Ties prefer official sources:
+# Streamline SDK (GitHub) > OTA staging > OTA production > NVIDIA/DLSS (GitHub) > unknown.
 function Select-ComponentWinners([object[]]$Candidates) {
-    $priority = @{ 'sdk-streamline' = 0; 'ota-staging' = 1; 'ota-production' = 2 }
-    $ok = @($Candidates) | Where-Object { $_ -and $_.Source -and $_.Dlss -and $_.Sl }
-    if (-not $ok) { throw 'Select-ComponentWinners: no complete candidates.' }
-    $rank = { if ($priority.ContainsKey($_.Source)) { $priority[$_.Source] } else { 3 } }
-    $byDlss = @($ok | Sort-Object -Property @{ Expression = { [version]$_.Dlss }; Descending = $true },
+    $priority = @{ 'sdk-streamline' = 0; 'ota-staging' = 1; 'ota-production' = 2; 'github-dlss' = 3 }
+    $rank = { if ($priority.ContainsKey($_.Source)) { $priority[$_.Source] } else { 4 } }
+    $okDlss = @($Candidates) | Where-Object { $_ -and $_.Source -and $_.Dlss }
+    if (-not $okDlss) { throw 'Select-ComponentWinners: no candidates with a DLSS version.' }
+    $byDlss = @($okDlss | Sort-Object -Property @{ Expression = { [version]$_.Dlss }; Descending = $true },
                                      @{ Expression = $rank })
-    $bySl   = @($ok | Sort-Object -Property @{ Expression = { [version]$_.Sl }; Descending = $true },
-                                     @{ Expression = $rank })
-    return [pscustomobject]@{
+    $result = [pscustomobject]@{
         DlssSource  = $byDlss[0].Source
         DlssVersion = $byDlss[0].Dlss
-        SlSource    = $bySl[0].Source
-        SlVersion   = $bySl[0].Sl
+        SlSource    = $null
+        SlVersion   = $null
     }
+    $okSl = @($Candidates) | Where-Object { $_ -and $_.Source -and $_.Sl }
+    if ($okSl) {
+        $bySl = @($okSl | Sort-Object -Property @{ Expression = { [version]$_.Sl }; Descending = $true },
+                                         @{ Expression = $rank })
+        $result.SlSource = $bySl[0].Source
+        $result.SlVersion = $bySl[0].Sl
+    }
+    return $result
+}
+
+# rhi-repo mirror builds for one section: newest-first candidates @{ Tag; Version; AssetName }.
+# Only tags matching "<prefix>-<version>" count - community variants (renodx-*, DLSS-Enabler-*)
+# are deliberately NOT sources. Version keeps its full tag remainder (suffixes like -RTX40 stay
+# in the asset name); sorting uses the numeric prefix, and list order (GitHub API: newest first)
+# breaks ties. Tags whose numeric prefix does not parse (e.g. dlssnr-310.8.SF) are skipped.
+function Get-RhiMirrorBuilds([object[]]$Releases, [string]$Section) {
+    $map = @{
+        'dlss'       = @{ TagPrefix = 'dlss-';       AssetPrefix = 'nvngx_dlss_' }
+        'dlssd'      = @{ TagPrefix = 'dlssd-';      AssetPrefix = 'nvngx_dlssd_' }
+        'dlssg'      = @{ TagPrefix = 'dlssg-';      AssetPrefix = 'nvngx_dlssg_' }
+        'streamline' = @{ TagPrefix = 'streamline-'; AssetPrefix = 'streamline_' }
+        'dlssnr'     = @{ TagPrefix = 'dlssnr-';     AssetPrefix = 'nvngx_dlssnr_' }
+    }
+    if (-not $map.ContainsKey($Section)) { return @() }
+    $tagPrefix = $map[$Section].TagPrefix
+    $assetPrefix = $map[$Section].AssetPrefix
+    $cands = @()
+    $order = 0
+    foreach ($r in @($Releases)) {
+        $order++
+        if (-not $r -or -not $r.tag_name -or -not $r.tag_name.StartsWith($tagPrefix)) { continue }
+        $version = $r.tag_name.Substring($tagPrefix.Length)
+        if (-not $version) { continue }
+        $sortVersion = $version
+        try { $null = [version]$sortVersion } catch {
+            $sortVersion = $version -replace '-[A-Za-z0-9.]+$', ''
+            try { $null = [version]$sortVersion } catch { continue }
+        }
+        $assetName = "$assetPrefix$version.zip"
+        $asset = @($r.assets) | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+        if (-not $asset) { continue }
+        $cands += @{ Tag = $r.tag_name; Version = $version; SortVersion = $sortVersion; AssetName = $assetName; Asset = $asset; Order = $order }
+    }
+    # callers wrap with @() (PowerShell convention): single-element lists unroll to a bare
+    # hashtable across the pipeline, so [0]/.Count at a caller only work on the wrapped value
+    return @($cands | Sort-Object -Property @{ Expression = { [version]$_.SortVersion }; Descending = $true },
+                               @{ Expression = { $_.Order } })
+}
+
+# The NVIDIA/DLSS GitHub release asset carrying the runtime demo + DLLs (Windows build only).
+function Get-DlssRepoAssetName([string[]]$AssetNames) {
+    $win = @($AssetNames) | Where-Object { $_ -match '^ngx_dlss_demo_windows\.zip$' } | Select-Object -First 1
+    if ($win) { return $win }
+    return (@($AssetNames) | Where-Object { $_ -match 'demo_windows.*\.zip$' } | Select-Object -First 1)
+}
+
+# Cheap pre-gate: true when the live multi-feed probe differs from the stored probe state
+# (probe-state.json attached to the newest release). $null/$empty pairs compare equal, and a
+# missing stored state counts as a difference so the first run always bootstraps a full export.
+function Test-ProbeStateDiffers($Live, $Stored) {
+    if (-not $Stored) { return $true }
+    foreach ($p in 'stagingDlss', 'stagingSl', 'productionDlss', 'productionSl', 'sdkTag', 'dlssRepoTag', 'dlssnrMirrorMax') {
+        $l = [string]$Live.$p
+        $s = [string]$Stored.$p
+        if ($l -ne $s -and -not (([string]::IsNullOrEmpty($l)) -and ([string]::IsNullOrEmpty($s)))) { return $true }
+    }
+    return $false
 }
 
 # The x64 Streamline SDK zip asset: streamline-sdk-v<ver>.zip (excludes -aarch64/-arm64ec).
@@ -244,5 +310,8 @@ function Get-UnverifiedDlssnrSpec {
     'Resolve-7ZipTool',
     'New-7zArchive',
     'Expand-7zArchive',
+    'Get-RhiMirrorBuilds',
+    'Get-DlssRepoAssetName',
+    'Test-ProbeStateDiffers',
     'Test-ReleaseTagNewer'
 )

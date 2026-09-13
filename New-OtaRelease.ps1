@@ -53,7 +53,78 @@ function Get-PreviousChecksums([string]$RepoFull, [string]$PrevTag) {
     return $null
 }
 
-# ---------------------------------------------------------------- 1. export current state (multi-source)
+# ---------------------------------------------------------------- 0. cheap pre-gate (multi-feed probe)
+# Reads 2 OTA manifests + 3 GitHub endpoints (no payload downloads) and compares against the
+# probe-state.json asset attached to the newest release. When nothing changed anywhere, the
+# heavy export is skipped entirely - scheduled polls cost seconds, not minutes.
+if (-not $Repo) {
+    $remote = git -C $repoRoot remote get-url origin
+    $Repo = ($remote -replace '.*github\.com[:/]', '' -replace '\.git$', '')
+}
+$otaChannelRoots = @{ Staging = 'dev-models'; Production = '3e933c08-ea30-45ae-93d1-5114edf9c3b9' }
+$otaManifestPath = 'config/versions/2/files/nvngx_server_config.txt'
+$ghHeaders = if ($env:GH_TOKEN) { @{ Authorization = "Bearer $($env:GH_TOKEN)" } } else { @{} }
+function Get-LatestTag([string]$RepoSlug) {
+    try {
+        $r = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/releases/latest" -Headers $ghHeaders -TimeoutSec 20
+        return [string]$r.tag_name
+    } catch { Write-Host "    ! $RepoSlug latest tag unreachable" -ForegroundColor Yellow; return '' }
+}
+
+Write-Host '==> Probing feeds (cheap pre-gate)' -ForegroundColor Cyan
+$probeLive = [pscustomobject]@{
+    stagingDlss     = $null
+    stagingSl       = $null
+    productionDlss  = $null
+    productionSl    = $null
+    sdkTag          = Get-LatestTag 'NVIDIA-RTX/Streamline'
+    dlssRepoTag     = Get-LatestTag 'NVIDIA/DLSS'
+    dlssnrMirrorMax = ''
+}
+foreach ($ch in 'Staging', 'Production') {
+    try {
+        $m = Invoke-RestMethod -Uri "https://ngx.download.nvidia.com/$($otaChannelRoots[$ch])/org/nvidia/team/ngx/models/$otaManifestPath" -TimeoutSec 30
+        $body = if ($m -is [string]) { $m } else { [System.Text.Encoding]::UTF8.GetString($m) }
+        $probeLive."$($ch.ToLower())Dlss" = Get-OtaSectionVersion $body 'dlss'
+        $slSdk = Get-OtaSectionVersion $body 'sl_sdk_0'
+        $probeLive."$($ch.ToLower())Sl" = if ($slSdk) { $slSdk } else { Get-OtaSectionVersion $body 'dlss_override' }
+        if (-not $probeLive.dlssnrMirrorMax) { $probeLive.dlssnrMirrorMax = Get-OtaSectionVersion $body 'dlssnr' }
+    } catch { Write-Host "    ! $ch manifest unreachable" -ForegroundColor Yellow }
+}
+try {
+    $rhiRels = Invoke-RestMethod -Uri 'https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100' -Headers $ghHeaders -TimeoutSec 20
+    $snr = @(Get-RhiMirrorBuilds @($rhiRels) 'dlssnr')
+    if ($snr.Count) {
+        $mirrorMax = [string]$snr[0].Version
+        $cur = $probeLive.dlssnrMirrorMax
+        if (-not $cur -or (Compare-OtaNewer $mirrorMax $cur)) { $probeLive.dlssnrMirrorMax = $mirrorMax }
+    }
+} catch { Write-Host '    ! rhi-repo index unreachable' -ForegroundColor Yellow }
+
+$storedProbe = $null
+$newestRelTag = $null
+try {
+    $relList = gh api --paginate "repos/$Repo/releases?per_page=100" 2>$null | ConvertFrom-Json
+    $newestRelTag = Get-NewestReleaseTag @($relList | ForEach-Object { $_.tag_name })
+    $newestRel = @($relList) | Where-Object { $_.tag_name -eq $newestRelTag } | Select-Object -First 1
+    if ($newestRel) {
+        $probeAsset = @($newestRel.assets) | Where-Object { $_.name -eq 'probe-state.json' } | Select-Object -First 1
+        if ($probeAsset) {
+            $probeTmp = Join-Path $env:TEMP 'ota-probe-state.json'
+            gh api -H 'Accept: application/octet-stream' "repos/$Repo/releases/assets/$($probeAsset.id)" > $probeTmp 2>$null
+            if ((Get-Item $probeTmp).Length -gt 0) { $storedProbe = Get-Content $probeTmp -Raw | ConvertFrom-Json }
+        }
+    }
+} catch { Write-Host '    ! probe state unavailable (will export)' -ForegroundColor Yellow }
+
+if (-not (Test-ProbeStateDiffers $probeLive $storedProbe)) {
+    Write-Host "==> No feed changed since $newestRelTag. Nothing to do." -ForegroundColor Green
+    exit 0
+}
+Write-Host '    Feed state changed - running the full export.' -ForegroundColor Cyan
+$probeStatePath = Join-Path $env:TEMP 'probe-state.json'
+$probeLive | ConvertTo-Json | Set-Content $probeStatePath -Encoding UTF8
+
 Write-Host '==> Exporting current newest state' -ForegroundColor Cyan
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("nvngx-release-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 powershell -NoProfile -ExecutionPolicy Bypass -File $exportScript -OutDir $work -Channel $Channel
@@ -92,6 +163,10 @@ $existing = gh api --paginate "repos/$Repo/releases?per_page=100" --jq '.[].tag_
 $maxTag = Get-NewestReleaseTag @($existing)
 if ($maxTag -and -not (Test-ReleaseTagNewer $dlssVer $slVer $maxTag)) {
     Write-Host "==> Candidate $tag is not newer than the newest existing release $maxTag. Nothing to do." -ForegroundColor Green
+    # persist the probe state so later polls can skip the heavy export again
+    if ($probeStatePath -and (Test-Path $probeStatePath)) {
+        gh release upload $maxTag $probeStatePath --repo $Repo --clobber 2>$null
+    }
     Remove-Item $work -Recurse -Force
     exit 0
 }
@@ -191,7 +266,7 @@ $notes | Set-Content $notesPath -Encoding UTF8
 
 # ---------------------------------------------------------------- 5. publish
 Write-Host "==> Creating GitHub release $tag" -ForegroundColor Cyan
-gh release create $tag $assetPath $checksumsPath $snrAssets `
+gh release create $tag $assetPath $checksumsPath $snrAssets $probeStatePath `
     --repo $Repo `
     --title "NVIDIA RTX OTA $tag" `
     --notes-file $notesPath

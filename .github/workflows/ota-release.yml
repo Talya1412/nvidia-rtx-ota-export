@@ -1,15 +1,15 @@
 name: ota-release
 
-# Runs the OTA pre-release exporter weekly. It only publishes a new GitHub Release
-# when NVIDIA's OTA manifest reports a version newer than the latest release tag.
+# Polls every 3 hours. A cheap pre-gate (New-OtaRelease.ps1 step 0) exits in seconds when no
+# tracked feed changed; only a real feed change triggers the heavy export + release step.
 
 on:
   schedule:
-    - cron: '0 9 * * 1' # every Monday 09:00 UTC
+    - cron: '0 */3 * * *' # every 3 hours; the cheap pre-gate exits in seconds when nothing changed
   workflow_dispatch:
     inputs:
       channel:
-        description: 'Source to track (Newest = per-component newest across OTA + Streamline SDK)'
+        description: 'Source to track (Newest = per-component newest across OTA + Streamline SDK + NVIDIA/DLSS)'
         type: choice
         default: Newest
         options:
@@ -17,6 +17,10 @@ on:
           - Sdk
           - Staging
           - Production
+
+concurrency:
+  group: ota-release
+  cancel-in-progress: false
 
 permissions:
   contents: write

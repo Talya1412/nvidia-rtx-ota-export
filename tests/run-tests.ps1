@@ -172,6 +172,46 @@ Assert-True 'pinned 7z: official standalone console build URL' ((Get-Pinned7zrSp
 Assert-True 'pinned 7z: SHA-256 pin is the exact recorded digest' ((Get-Pinned7zrSpec).Sha256 -eq 'ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d')
 Assert-True 'pinned 7z: resolver is exported' ($null -ne (Get-Command Resolve-7ZipTool -ErrorAction SilentlyContinue))
 
+# ---------------------------------------------------------------- multi-feed expansion (new sources)
+$mockRhi = @(
+    @{ tag_name = 'renodx-dlss5-5.2.1';   assets = @(@{ name = 'renodx-dlss5_5.2.1.zip' }) },
+    @{ tag_name = 'dlss-310.9.1';         assets = @(@{ name = 'nvngx_dlss_310.9.1.zip' }) },
+    @{ tag_name = 'dlss-310.9.0';         assets = @(@{ name = 'nvngx_dlss_310.9.0.zip' }) },
+    @{ tag_name = 'dlssd-310.9.1';        assets = @(@{ name = 'nvngx_dlssd_310.9.1.zip' }) },
+    @{ tag_name = 'dlssg-310.9.1';        assets = @(@{ name = 'nvngx_dlssg_310.9.1.zip' }) },
+    @{ tag_name = 'streamline-2.14.1.0';  assets = @(@{ name = 'streamline_2.14.1.0.zip' }) },
+    @{ tag_name = 'streamline-2.14.0.0';  assets = @(@{ name = 'streamline_2.14.0.0.zip' }) },
+    @{ tag_name = 'dlssnr-310.9.0';       assets = @(@{ name = 'nvngx_dlssnr_310.9.0.zip' }) },
+    @{ tag_name = 'dlssnr-310.8.0-RTX40'; assets = @(@{ name = 'nvngx_dlssnr_310.8.0-RTX40.zip' }) },
+    @{ tag_name = 'dlssnr-310.8.SF';      assets = @(@{ name = 'nvngx_dlssnr_310.8.SF.zip' }) },
+    @{ tag_name = 'DLSS-Enabler-4.10.0';  assets = @(@{ name = 'DLSS-Enabler-4.10.0.zip' }) }
+)
+$mDlss = @(Get-RhiMirrorBuilds $mockRhi 'dlss')
+Assert-True 'mirror: dlss newest first, unrelated prefixes filtered' ($mDlss.Count -eq 2 -and $mDlss[0].Version -eq '310.9.1' -and $mDlss[0].Tag -eq 'dlss-310.9.1')
+Assert-True 'mirror: dlss asset name mapping' ($mDlss[0].AssetName -eq 'nvngx_dlss_310.9.1.zip')
+Assert-True 'mirror: dlssd section isolated' ((@(Get-RhiMirrorBuilds $mockRhi 'dlssd'))[0].AssetName -eq 'nvngx_dlssd_310.9.1.zip')
+Assert-True 'mirror: streamline 4-part version' ((@(Get-RhiMirrorBuilds $mockRhi 'streamline'))[0].Version -eq '2.14.1.0')
+$snrM = @(Get-RhiMirrorBuilds $mockRhi 'dlssnr')
+Assert-True 'mirror: dlssnr suffix-tolerant, newest first (non-numeric suffix tag skipped)' ($snrM.Count -eq 2 -and $snrM[0].Version -eq '310.9.0' -and $snrM[1].Version -eq '310.8.0-RTX40')
+Assert-True 'mirror: dlssnr asset keeps full version incl. suffix' ($snrM[1].AssetName -eq 'nvngx_dlssnr_310.8.0-RTX40.zip')
+Assert-True 'mirror: unknown section -> empty' (@(Get-RhiMirrorBuilds $mockRhi 'nosuch').Count -eq 0)
+
+Assert-True 'dlss repo asset: demo windows picked' ((Get-DlssRepoAssetName @('ngx_dlss_demo_linux.zip', 'ngx_dlss_demo_windows.zip')) -eq 'ngx_dlss_demo_windows.zip')
+Assert-True 'dlss repo asset: no windows asset -> null' ($null -eq (Get-DlssRepoAssetName @('ngx_dlss_demo_linux.zip')))
+
+$probeLive = [pscustomobject]@{ stagingDlss = '310.9.0'; stagingSl = '2.14.0'; productionDlss = '310.7.128'; productionSl = '2.12.128'; sdkTag = 'v2.14.1'; dlssRepoTag = 'v310.9.1'; dlssnrMirrorMax = '310.8.0' }
+Assert-True 'probe: identical state -> no diff' (-not (Test-ProbeStateDiffers $probeLive $probeLive))
+$probeOld = [pscustomobject]@{ stagingDlss = '310.9.0'; stagingSl = '2.14.0'; productionDlss = '310.7.128'; productionSl = '2.12.128'; sdkTag = 'v2.14.1'; dlssRepoTag = 'v310.9.0'; dlssnrMirrorMax = '310.8.0' }
+Assert-True 'probe: one field differs -> diff' (Test-ProbeStateDiffers $probeLive $probeOld)
+Assert-True 'probe: missing stored state -> diff (bootstrap)' (Test-ProbeStateDiffers $probeLive $null)
+Assert-True 'probe: null vs empty string are equal' (-not (Test-ProbeStateDiffers ([pscustomobject]@{ stagingDlss = $null }) ([pscustomobject]@{ stagingDlss = '' })))
+
+$dlssOnlyWin = Select-ComponentWinners @(@{ Source = 'github-dlss'; Dlss = '310.9.1'; Sl = $null }, @{ Source = 'ota-staging'; Dlss = '310.9.0'; Sl = '2.14.0' })
+Assert-True 'winners: DLSS-only official source wins DLSS, never SL' ($dlssOnlyWin.DlssSource -eq 'github-dlss' -and $dlssOnlyWin.DlssVersion -eq '310.9.1' -and $dlssOnlyWin.SlSource -eq 'ota-staging' -and $dlssOnlyWin.SlVersion -eq '2.14.0')
+Assert-True 'winners: older DLSS-only source loses to official with same SL' ((Select-ComponentWinners @(@{ Source = 'github-dlss'; Dlss = '310.9.1'; Sl = $null }, @{ Source = 'sdk-streamline'; Dlss = '310.9.1'; Sl = '2.14.1' })).SlSource -eq 'sdk-streamline')
+Assert-True 'dlssnr: mirror newer than pinned universal wins (newest-wins)' ((Select-DlssnrBuild @(@{ Tag = 'pinned-universal'; Version = '310.8.0'; Pass = $true }, @{ Tag = 'dlssnr-310.9.0'; Version = '310.9.0'; Pass = $true })) -eq 'dlssnr-310.9.0')
+Assert-True 'dlssnr: version tie prefers pinned universal (listed first)' ((Select-DlssnrBuild @(@{ Tag = 'pinned-universal'; Version = '310.8.0'; Pass = $true }, @{ Tag = 'dlssnr-310.8.0'; Version = '310.8.0'; Pass = $true })) -eq 'pinned-universal')
+
 
 # ---------------------------------------------------------------- integration suite (frozen release fixtures)
 # Runs with -Integration (also wired into .github/workflows/ota-release.yml). Downloads the real

@@ -5,16 +5,20 @@
 
 .DESCRIPTION
   Pipeline (fully unattended):
-  1. Gather sources: NGX OTA staging + production manifests, plus the latest Streamline SDK
-     release on GitHub (its bin/x64 production DLLs carry both DLSS and Streamline builds).
-  2. Download each source's payload: the OTA dlss_override bundle per channel (production's
-     only when its pin beats staging's - otherwise OTA is served via raw per-component
-     payloads), and the SDK zip (bin/x64 only).
-  3. Pick the per-component winner (numeric compare; ties prefer the SDK repo): DLSS DLLs
-     from one source, Streamline plugins from another - always the newest available of each.
+  1. Gather sources: NGX OTA staging + production manifests (whose sl_sdk_0 section carries the
+     real Streamline version, so the SL race needs no bundle download), the latest Streamline SDK
+     release on GitHub (bin/x64 production DLLs), and the NVIDIA/DLSS GitHub release (official
+     nvngx_dlss.dll inside the Windows demo zip). rhi-repo mirror builds (dlss/dlssd/dlssg/
+     streamline/dlssnr) are indexed as a hash-verified rescue/redundancy path, never raced.
+  2. Download the payloads that are actually needed: the winning OTA channel's dlss_override
+     bundle only (plus raw per-component .bin payloads whenever a manifest pin is strictly newer).
+  3. Pick the per-component winner (numeric compare; ties prefer the SDK repo, then OTA staging,
+     production, then NVIDIA/DLSS): DLSS DLLs from one source, Streamline plugins from another.
   4. Verify: OTA payloads against NVIDIA's published SHA-256 sidecars; every exported file must be
      an MZ PE. Authenticode status is reported, but it is not a hard rejection for allowlisted sources.
-5. Optional -Archive: package the output into a single 7z.
+  5. dlssnr (DLSS 5 Neural Rendering) as its own newest-wins asset: user-pinned universal build
+     (immutable SHA-256) against rhi-repo mirror builds, PE-gated.
+  6. Optional -Archive: package the output into a single 7z.
 
   Endpoints (reverse-engineered from NVIDIA's own Streamline OTA client, sl.ota/ota.cpp, registry
   NGXCore\CDNServerType = 0 production / 1 staging; verified live 2026-09-04; see README.md):
@@ -22,6 +26,8 @@
     Payload : https://ngx.download.nvidia.com/{channel}/org/nvidia/team/ngx/models/{component}/versions/{packed}/files/160_E658700{.bin|.zip}
     packed  = (major -shl 16) -bor (minor -shl 8) -bor patch
     SDK     : https://github.com/NVIDIA-RTX/Streamline/releases (asset streamline-sdk-v*.zip)
+    DLSS    : https://github.com/NVIDIA/DLSS/releases (asset ngx_dlss_demo_windows.zip)
+    Mirror  : https://github.com/RankFTW/rhi-repo/releases (dlss-/dlssd-/dlssg-/streamline-/dlssnr-)
 
 .PARAMETER OutDir
   Output folder for the exported DLLs. Default: <Downloads>\nvidia-ota-prerelease-<yyyyMMdd-HHmm>.
@@ -164,6 +170,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $wantSdk         = (-not $SkipGitHubCheck) -and ($Channel -in @('Newest', 'Sdk'))
 $wantStaging     = $Channel -in @('Newest', 'Staging')
 $wantProduction  = $Channel -in @('Newest', 'Production')
+$wantDlssRepo    = (-not $SkipGitHubCheck) -and ($Channel -eq 'Newest')
 
 function Get-OtaChannelState([string]$Ch) {
     try { $m = Get-UrlText "$(Get-ChannelBaseUrl $Ch)/$ManifestPath" }
@@ -173,10 +180,15 @@ function Get-OtaChannelState([string]$Ch) {
         Dlssd  = Get-OtaSectionVersion $m 'dlssd'
         Dlssg  = Get-OtaSectionVersion $m 'dlssg'
         Sl     = Get-OtaSectionVersion $m 'dlss_override'
+        # sl_sdk_0 carries the real Streamline runtime version. Verified live to equal the
+        # sl.common.dll FileVersion inside that channel's dlss_override bundle (2.14.0 staging /
+        # 2.12.128 production), so the SL race runs on manifest pins alone and only the winning
+        # channel's bundle is ever downloaded.
+        SlSdk  = Get-OtaSectionVersion $m 'sl_sdk_0'
         Dlssnr = Get-OtaSectionVersion $m 'dlssnr'
     }
-    if (-not ($o.Dlss -and $o.Dlssd -and $o.Dlssg -and $o.Sl)) {
-        Write-Warn2 "$Ch manifest incomplete: dlss=$($o.Dlss) dlssd=$($o.Dlssd) dlssg=$($o.Dlssg) dlss_override=$($o.Sl) - dropping channel."
+    if (-not ($o.Dlss -and $o.Dlssd -and $o.Dlssg -and $o.Sl -and $o.SlSdk)) {
+        Write-Warn2 "$Ch manifest incomplete: dlss=$($o.Dlss) dlssd=$($o.Dlssd) dlssg=$($o.Dlssg) dlss_override=$($o.Sl) sl_sdk=$($o.SlSdk) - dropping channel."
         return $null
     }
     return $o
@@ -201,7 +213,7 @@ if ($wantStaging)    { $s = Get-OtaChannelState 'Staging';    if ($s) { $ota['St
 if ($wantProduction) { $s = Get-OtaChannelState 'Production'; if ($s) { $ota['Production'] = $s } }
 if (($wantStaging -or $wantProduction) -and $ota.Count -eq 0) { throw 'No OTA manifest reachable - aborting.' }
 
-$sdk = $null
+$sdkSource = $null
 if ($wantSdk) {
     Write-Step 'Fetching latest Streamline SDK release (GitHub)'
     try {
@@ -215,53 +227,130 @@ if ($wantSdk) {
         Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmpSdkZip -UseBasicParsing
         Expand-ZipSubset $tmpSdkZip 'bin/x64' $tmpSdkDir
         Remove-Item $tmpSdkZip -Force
-        $sdk = @{
+        $sdkSource = @{
             Tag  = $rel.tag_name
             Dir  = $tmpSdkDir
             Dlss = ConvertTo-ShortVersion (Get-Item (Join-Path $tmpSdkDir 'nvngx_dlss.dll')).VersionInfo.FileVersion
             Sl   = ConvertTo-ShortVersion (Get-Item (Join-Path $tmpSdkDir 'sl.common.dll')).VersionInfo.FileVersion
         }
-        Write-Info "Streamline SDK $($rel.tag_name): DLSS $($sdk.Dlss) / SL $($sdk.Sl)"
+        Write-Info "Streamline SDK $($rel.tag_name): DLSS $($sdkSource.Dlss) / SL $($sdkSource.Sl)"
     } catch {
         Write-Warn2 "Streamline SDK source unavailable: $($_.Exception.Message) - continuing without it."
     }
 }
 
-# OTA bundles: staging always (its real SL version only exists inside the bundle); production
-# only when its dlss_override pin beats staging's (only then can it win SL / serve as base).
-$needProdBundle = $ota.ContainsKey('Production') -and (
-    (-not $ota.ContainsKey('Staging')) -or (Compare-OtaNewer $ota['Production'].Sl $ota['Staging'].Sl))
-foreach ($ch in 'Staging', 'Production') {
-    if (-not $ota.ContainsKey($ch)) { continue }
-    if ($ch -eq 'Production' -and -not $needProdBundle) { continue }
-    $o = $ota[$ch]
-    $packed = ConvertTo-PackedVersion $o.Sl
-    $tmpZip = Join-Path $env:TEMP "nvngx_ota_bundle_$packed.zip"
-    $url = "$(Get-ChannelBaseUrl $ch)/dlss_override/versions/$packed/files/${GenericPayload}.zip"
-    Write-Step "Downloading $ch dlss_override OTA bundle (pin $($o.Sl))"
-    Invoke-WebRequest -Uri $url -OutFile $tmpZip -UseBasicParsing
-    if (-not (Test-SidecarSha256 $tmpZip "$url.sha256")) { throw "$ch dlss_override bundle failed SHA-256 sidecar verification." }
-    $dir = Join-Path $env:TEMP "nvngx_ota_extract_$packed"
-    if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
-    [System.IO.Compression.ZipFile]::ExtractToDirectory($tmpZip, $dir)
-    $payload = Get-ChildItem $dir -Directory | Select-Object -First 1
-    $o.Dir     = $payload.FullName
-    $o.SlDll   = ConvertTo-ShortVersion (Get-Item (Join-Path $payload.FullName 'sl.common.dll')).VersionInfo.FileVersion
-    $o.DlssDll = ConvertTo-ShortVersion (Get-Item (Join-Path $payload.FullName 'nvngx_dlss.dll')).VersionInfo.FileVersion
-    Remove-Item $tmpZip -Force
-    Write-Info "$ch bundle: DLSS $($o.DlssDll) / SL $($o.SlDll)"
-}
-
-$candidates = @()
-foreach ($ch in 'Staging', 'Production') {
-    if ($ota.ContainsKey($ch) -and $ota[$ch].SlDll) {
-        $candidates += @{ Source = "ota-$($ch.ToLowerInvariant())"; Dlss = $ota[$ch].Dlss; Sl = $ota[$ch].SlDll }
+# NVIDIA/DLSS GitHub releases ship the official runtime demo (ngx_dlss_demo_windows.zip) with the
+# production nvngx_dlss.dll inside bin/ngx_dlss_demo - an official DLSS origin (SR only). Verified
+# live: 310.9.1 there is bit-identical to the Streamline SDK and the rhi-repo mirror bytes.
+$dlssRepo = $null
+if ($wantDlssRepo) {
+    Write-Step 'Fetching latest NVIDIA/DLSS release (GitHub)'
+    try {
+        $drel = Get-GitHubJson 'repos/NVIDIA/DLSS/releases/latest'
+        $demoName = Get-DlssRepoAssetName (@($drel.assets) | ForEach-Object { $_.name })
+        if (-not $demoName) { throw 'latest release has no Windows demo asset' }
+        $dasset = @($drel.assets) | Where-Object { $_.name -eq $demoName } | Select-Object -First 1
+        $tmpDemoZip = Join-Path $env:TEMP 'dlss-demo-latest.zip'
+        $tmpDemoDir = Join-Path $env:TEMP 'dlss-demo-latest'
+        if (Test-Path $tmpDemoDir) { Remove-Item $tmpDemoDir -Recurse -Force }
+        Invoke-WebRequest -Uri $dasset.browser_download_url -OutFile $tmpDemoZip -UseBasicParsing
+        Expand-ZipSubset $tmpDemoZip 'DLSS_Sample_App/bin/ngx_dlss_demo' $tmpDemoDir
+        Remove-Item $tmpDemoZip -Force
+        $dlssRepo = @{
+            Tag  = $drel.tag_name
+            Dir  = $tmpDemoDir
+            Dlss = ConvertTo-ShortVersion (Get-Item (Join-Path $tmpDemoDir 'nvngx_dlss.dll')).VersionInfo.FileVersion
+        }
+        Write-Info "NVIDIA/DLSS $($drel.tag_name): DLSS $($dlssRepo.Dlss) (SR only)"
+    } catch {
+        Write-Warn2 "NVIDIA/DLSS source unavailable: $($_.Exception.Message) - continuing without it."
     }
 }
-if ($sdk) { $candidates += @{ Source = 'sdk-streamline'; Dlss = $sdk.Dlss; Sl = $sdk.Sl } }
-if (-not $candidates) { throw 'No usable source (OTA and SDK both unavailable).' }
+
+# rhi-repo mirrors: exact re-hosts of official builds (verified bit-identical for dlss/dlssd/
+# dlssg/streamline), newest-first per section. They are NOT raced against official feeds - they
+# only serve as a rescue path when an official download fails, and only after the fetched bytes
+# match a trusted pin (OTA SHA-256 sidecar or the previous release's checksums).
+$mirrors = @{}
+if (-not $SkipGitHubCheck) {
+    try {
+        $rhiRels = Get-GitHubJson 'repos/RankFTW/rhi-repo/releases?per_page=100'
+        foreach ($sec in 'dlss', 'dlssd', 'dlssg', 'streamline', 'dlssnr') {
+            $mirrors[$sec] = @(Get-RhiMirrorBuilds @($rhiRels) $sec)
+        }
+        Write-Info "rhi-repo mirrors: dlss=$(@($mirrors['dlss']).Count) dlssd=$(@($mirrors['dlssd']).Count) dlssg=$(@($mirrors['dlssg']).Count) streamline=$(@($mirrors['streamline']).Count) dlssnr=$(@($mirrors['dlssnr']).Count)"
+    } catch {
+        Write-Warn2 "rhi-repo mirror index unavailable: $($_.Exception.Message) - rescue path disabled."
+    }
+}
+
+# Mirrors are deliberately NOT part of the winner race: a mirror can never legitimately be newer
+# than the official feed it re-hosts, and an unverifiable mirror must not ship. Winner selection
+# uses official sources only; mirrors are consulted afterwards, per file, when an official fetch fails.
+$candidates = @()
+foreach ($ch in 'Staging', 'Production') {
+    if ($ota.ContainsKey($ch)) {
+        $candidates += @{ Source = "ota-$($ch.ToLowerInvariant())"; Dlss = $ota[$ch].Dlss; Sl = $ota[$ch].SlSdk }
+    }
+}
+if ($sdkSource) { $candidates += @{ Source = 'sdk-streamline'; Dlss = $sdkSource.Dlss; Sl = $sdkSource.Sl } }
+if ($dlssRepo)  { $candidates += @{ Source = 'github-dlss';    Dlss = $dlssRepo.Dlss;  Sl = $null } }
+if (-not $candidates) { throw 'No usable source (OTA, Streamline SDK and NVIDIA/DLSS all unavailable).' }
 $winners = Select-ComponentWinners $candidates
 Write-Step "Winners: DLSS $($winners.DlssVersion) <- $($winners.DlssSource) | SL $($winners.SlVersion) <- $($winners.SlSource)"
+
+# The SL winner's payload becomes the base set, so only that channel's bundle is downloaded.
+$baseChannel = $null
+if ($winners.SlSource -eq 'ota-staging') { $baseChannel = 'Staging' }
+elseif ($winners.SlSource -eq 'ota-production') { $baseChannel = 'Production' }
+
+function Get-Sha256Sidecar([string]$SidecarUrl) {
+    # NVIDIA publishes a bare lowercase digest (64 bytes, no newline) next to each payload.
+    try {
+        $text = (Get-UrlText $SidecarUrl).Trim()
+        $expected = ($text -split '\s+')[0].ToLowerInvariant()
+        if ($expected -match '^[0-9a-f]{64}$') { return $expected }
+    } catch { }
+    return $null
+}
+
+# Mirror rescue for one mirrored component zip: fetch, then accept ONLY when the contained DLL
+# hashes to the trusted pin ($TrustedSha) - a mirror without a matching pin is never used.
+function Get-MirrorDll([object[]]$Candidates, [string]$DllName, [string]$TrustedSha, [string]$DestPath) {
+    foreach ($cand in @($Candidates)) {
+        if (-not $cand) { continue }
+        $tmpZip = Join-Path $env:TEMP "mirror-$($cand.Tag).zip"
+        $tmpDir = Join-Path $env:TEMP "mirror-$($cand.Tag)"
+        try {
+            Invoke-WebRequest -Uri $cand.Asset.browser_download_url -OutFile $tmpZip -UseBasicParsing
+            Expand-ZipSubset $tmpZip '' $tmpDir
+            $dll = Join-Path $tmpDir $DllName
+            if (-not (Test-Path $dll)) {
+                Write-Warn2 "mirror $($cand.Tag): $DllName missing in archive."
+                continue
+            }
+            $hash = Get-FileSha256 $dll
+            if (-not (Test-Sha256Pin $hash $TrustedSha)) {
+                Write-Warn2 "mirror $($cand.Tag): $DllName SHA-256 mismatch (expected $TrustedSha, got $hash) - refused."
+                continue
+            }
+            Copy-Item $dll $DestPath -Force
+            Write-Info "mirror $($cand.Tag): $DllName accepted (SHA-256 matches trusted pin)."
+            return $true
+        } catch {
+            Write-Warn2 "mirror $($cand.Tag): $DllName fetch failed ($($_.Exception.Message))."
+        } finally {
+            if (Test-Path $tmpZip) { Remove-Item $tmpZip -Force }
+            if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
+        }
+    }
+    return $false
+}
+
+# mirrored Streamline sets are NOT a rescue path: a set whose DLLs could be verified against
+# known-good hashes is by definition a re-ship of an already-released version (which the publish
+# gate blocks anyway), and an unverifiable newer set must never ship. An official bundle/SDK
+# failure therefore fails the run and is retried on the next poll.
 
 # ---------------------------------------------------------------- compose export
 if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
@@ -271,31 +360,53 @@ $sources = @(
     "sl=$($winners.SlVersion)=$($winners.SlSource)"
 )
 foreach ($ch in 'Staging', 'Production') {
-    if ($ota.ContainsKey($ch) -and $ota[$ch].SlDll) { $sources += "$($ch.ToLowerInvariant())=$($ota[$ch].Dlss)/$($ota[$ch].SlDll)" }
+    if ($ota.ContainsKey($ch)) { $sources += "$($ch.ToLowerInvariant())=$($ota[$ch].Dlss)/$($ota[$ch].SlSdk)" }
 }
-if ($sdk) { $sources += "sdk=$($sdk.Sl)" }
+if ($sdkSource) { $sources += "sdk=$($sdkSource.Sl)" }
+if ($dlssRepo)  { $sources += "dlss-repo=$($dlssRepo.Dlss)" }
 Set-Content -Path (Join-Path $OutDir 'export-sources.txt') -Value $sources -Encoding Ascii
 
-# base set = the SL winner's full payload (production flavor everywhere)
+# base set = the SL winner's full payload (production flavor everywhere); the winning OTA
+# channel's dlss_override bundle is the only bundle ever downloaded
 if ($winners.SlSource -eq 'sdk-streamline') {
-    Copy-Item (Join-Path $sdk.Dir '*.dll') $OutDir -Force
-} else {
-    $ch = if ($winners.SlSource -eq 'ota-staging') { 'Staging' } else { 'Production' }
-    Copy-Item (Join-Path $ota[$ch].Dir '*.dll') $OutDir -Force
+    Copy-Item (Join-Path $sdkSource.Dir '*.dll') $OutDir -Force
+} elseif ($baseChannel) {
+    $o = $ota[$baseChannel]
+    $packed = ConvertTo-PackedVersion $o.Sl
+    $tmpZip = Join-Path $env:TEMP "nvngx_ota_bundle_$packed.zip"
+    $url = "$(Get-ChannelBaseUrl $baseChannel)/dlss_override/versions/$packed/files/${GenericPayload}.zip"
+    Write-Step "Downloading $baseChannel dlss_override OTA bundle (pin $($o.Sl))"
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $tmpZip -UseBasicParsing
+        if (-not (Test-SidecarSha256 $tmpZip "$url.sha256")) { throw "$baseChannel dlss_override bundle failed SHA-256 sidecar verification." }
+        $dir = Join-Path $env:TEMP "nvngx_ota_extract_$packed"
+        if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($tmpZip, $dir)
+        $payload = Get-ChildItem $dir -Directory | Select-Object -First 1
+        Copy-Item (Join-Path $payload.FullName '*.dll') $OutDir -Force
+        Remove-Item $dir -Recurse -Force
+        Write-Info "$baseChannel bundle extracted (SL pin $($o.SlSdk))."
+    } catch {
+        throw "SL winner $($winners.SlSource) $($winners.SlVersion): dlss_override bundle fetch failed - $($_.Exception.Message)"
+    } finally {
+        if (Test-Path $tmpZip) { Remove-Item $tmpZip -Force }
+    }
 }
 
-# DLSS fix-up: SDK won DLSS but the base set came from an OTA channel
+# DLSS fix-up: the DLSS winner's DLLs overlay the base set whenever they come from another source
 if ($winners.DlssSource -eq 'sdk-streamline' -and $winners.SlSource -ne 'sdk-streamline') {
     foreach ($dll in 'nvngx_dlss.dll', 'nvngx_dlssd.dll', 'nvngx_dlssg.dll') {
-        Copy-Item (Join-Path $sdk.Dir $dll) (Join-Path $OutDir $dll) -Force
+        Copy-Item (Join-Path $sdkSource.Dir $dll) (Join-Path $OutDir $dll) -Force
     }
     Write-Info 'DLSS DLLs taken from the Streamline SDK (newer than the OTA set).'
+} elseif ($winners.DlssSource -eq 'github-dlss') {
+    Copy-Item (Join-Path $dlssRepo.Dir 'nvngx_dlss.dll') (Join-Path $OutDir 'nvngx_dlss.dll') -Force
+    Write-Info 'DLSS Super Resolution taken from the NVIDIA/DLSS GitHub demo release.'
 }
 
 # payload dirs are consumed by the composition above - clean them up only now
-foreach ($ch in 'Staging', 'Production') {
-    if ($ota.ContainsKey($ch) -and $ota[$ch].Dir) { Remove-Item $ota[$ch].Dir -Recurse -Force }
-}
+if ($sdkSource -and (Test-Path $sdkSource.Dir)) { Remove-Item $sdkSource.Dir -Recurse -Force }
+if ($dlssRepo -and (Test-Path $dlssRepo.Dir)) { Remove-Item $dlssRepo.Dir -Recurse -Force }
 
 # OTA raw refresh: any reachable OTA manifest pin strictly newer than an exported DLL wins
 foreach ($ch in 'Staging', 'Production') {
@@ -327,102 +438,95 @@ foreach ($ch in 'Staging', 'Production') {
                 Write-Info "$ch/$($c.Section): served from the driver's local OTA cache (SHA-256 verified against NVIDIA's sidecar)."
             } else {
                 $tmpBin = Join-Path $env:TEMP "$($c.Dll).ota.bin"
-                Invoke-WebRequest -Uri $binUrl -OutFile $tmpBin -UseBasicParsing
-                if (-not (Test-SidecarSha256 $tmpBin "$binUrl.sha256")) { throw "$ch/$($c.Section) payload failed SHA-256 sidecar verification." }
-                Copy-Item $tmpBin $dllPath -Force
-                Remove-Item $tmpBin -Force
+                try {
+                    Invoke-WebRequest -Uri $binUrl -OutFile $tmpBin -UseBasicParsing
+                    if (-not (Test-SidecarSha256 $tmpBin "$binUrl.sha256")) { throw 'payload failed SHA-256 sidecar verification.' }
+                    Copy-Item $tmpBin $dllPath -Force
+                } catch {
+                    # Rescue: a mirrored build of the same version, accepted only when the fetched
+                    # DLL hashes to NVIDIA's published sidecar digest for this exact payload.
+                    Write-Warn2 "$ch/$($c.Section) raw payload unavailable ($($_.Exception.Message)) - trying rhi-repo mirror."
+                    $trustedSha = Get-Sha256Sidecar "$binUrl.sha256"
+                    if (-not $trustedSha) { throw "$ch/$($c.Section) payload failed and no sidecar digest is available to verify a mirror." }
+                    if (-not (Get-MirrorDll $mirrors[$c.Section] $c.Dll $trustedSha $dllPath)) {
+                        throw "$ch/$($c.Section) payload unavailable and no mirror build matched the sidecar digest."
+                    }
+                } finally {
+                    if (Test-Path $tmpBin) { Remove-Item $tmpBin -Force }
+                }
             }
         }
     }
 }
-if ($sdk -and (Test-Path $sdk.Dir)) { Remove-Item $sdk.Dir -Recurse -Force }
-
-# The user's tested all-RTX DLL is a deliberately hash-pinned exception. It is fetched from a
-# release URL available to CI, checked against its immutable DLL SHA-256, labeled UNVERIFIED,
-# and kept outside the main DLL set. Mirror fallbacks use the same PE-only policy.
+# dlssnr (DLSS 5 Neural Rendering) ships as its own per-GPU asset, selected newest-wins across
+# the user-pinned universal build and the rhi-repo mirror builds. NVIDIA publishes no official
+# feed for this component any more (its OTA section is gone from both channels), so the PE gate
+# plus the recorded SHA-256 is the integrity control: the pinned build additionally must match
+# its immutable hash. Candidates are tried newest-first; a failing candidate is skipped and the
+# next one is used, so the newest *valid* build wins.
 $dlssnrNote = ''
 if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
-    Write-Step 'Checking dlssnr (pinned universal asset first; PE-only mirror fallback)'
+    Write-Step 'Resolving dlssnr (newest PE-valid build across the pinned universal asset and rhi-repo mirrors)'
     $unverifiedSpec = Get-UnverifiedDlssnrSpec
-    $pinnedArchive = Join-Path $env:TEMP ("pinned-" + $unverifiedSpec.AssetName)
-    $pinnedDir = Join-Path $env:TEMP 'dlssnr-pinned-universal'
-    $pinnedAssetPath = Join-Path $OutDir $unverifiedSpec.AssetName
-    try {
-        Invoke-WebRequest -Uri $unverifiedSpec.Url -OutFile $pinnedArchive -UseBasicParsing
-        Expand-7zArchive $pinnedArchive $pinnedDir
-        $pinnedDll = Join-Path $pinnedDir 'nvngx_dlssnr.dll'
-        $pinnedHash = Get-FileSha256 $pinnedDll
-        if (-not (Test-Sha256Pin $pinnedHash $unverifiedSpec.Sha256)) {
-            throw "pinned universal DLL SHA-256 mismatch: expected $($unverifiedSpec.Sha256), got $pinnedHash"
-        }
-        $pinnedVerification = Get-DllVerification $pinnedDll
-        if (-not $pinnedVerification.Accepted) { throw 'pinned universal dlssnr is not a PE image' }
-        $pinnedStage = Join-Path $env:TEMP 'dlssnr-pinned-stage'
-        if (Test-Path $pinnedStage) { Remove-Item $pinnedStage -Recurse -Force }
-        New-Item -ItemType Directory -Path $pinnedStage -Force | Out-Null
-        Copy-Item $pinnedDll (Join-Path $pinnedStage 'nvngx_dlssnr.dll') -Force
-        New-7zArchive $pinnedAssetPath (Join-Path $pinnedStage '*.dll') | Out-Null
-        Remove-Item $pinnedStage -Recurse -Force
-        $dlssnrNote = "- ``$($unverifiedSpec.AssetName)`` (user-pinned universal build, version $($unverifiedSpec.Version)): **UNVERIFIED** Authenticode status; exact DLL SHA-256 ``$pinnedHash`` matches the immutable pin. Source: ``$($unverifiedSpec.Source)``.`n"
-        Write-Info "dlssnr universal: pinned SHA-256 verified; publishing $($unverifiedSpec.AssetName)."
-    } catch {
-        Write-Warn2 "Pinned universal dlssnr unavailable: $($_.Exception.Message) - trying PE-only mirror fallback."
-        $dlssnrNote = "- Pinned universal asset unavailable: $($_.Exception.Message).`n"
-    } finally {
-        if (Test-Path $pinnedArchive) { Remove-Item $pinnedArchive -Force }
-        if (Test-Path $pinnedDir) { Remove-Item $pinnedDir -Recurse -Force }
+    $snrCandidates = @(@{ Tag = 'pinned-universal'; Version = $unverifiedSpec.Version; SortVersion = $unverifiedSpec.Version; Order = 0; Kind = 'pinned'; Spec = $unverifiedSpec })
+    $order = 0
+    foreach ($m in @($mirrors['dlssnr'])) {
+        if (-not $m) { continue }
+        $order++
+        $snrCandidates += @{ Tag = $m.Tag; Version = $m.Version; SortVersion = $m.SortVersion; Order = $order; Kind = 'mirror'; Cand = $m }
     }
-
-    if (-not (Test-Path $pinnedAssetPath)) {
+    $snrOrdered = @($snrCandidates | Sort-Object -Property @{ Expression = { [version]$_.SortVersion }; Descending = $true },
+                                                @{ Expression = { $_.Order } })
+    $snrAccepted = $null
+    $snrRejected = @()
+    foreach ($cand in $snrOrdered) {
+        $ext = if ($cand.Kind -eq 'pinned') { '.7z' } else { '.zip' }
+        $tmpZip = Join-Path $env:TEMP ("dlssnr-" + ($cand.Tag -replace '[^A-Za-z0-9.-]', '_') + $ext)
+        $tmpDir = Join-Path $env:TEMP ("dlssnr-" + ($cand.Tag -replace '[^A-Za-z0-9.-]', '_'))
         try {
-            $snrRels = Get-GitHubJson 'repos/RankFTW/rhi-repo/releases?per_page=100'
-            $snrCands = @()
-            foreach ($r in @($snrRels)) {
-                if ($r.tag_name -notmatch '^dlssnr-(.+)$') { continue }
-                $snrVer = $Matches[1]
-                try { $null = [version]($snrVer -replace '-[A-Za-z0-9.]+$', '') } catch { continue }
-                $snrAsset = @($r.assets) | Where-Object { $_.name -eq "nvngx_dlssnr_$snrVer.zip" } | Select-Object -First 1
-                if ($snrAsset) { $snrCands += @{ Tag = $r.tag_name; Version = $snrVer; Asset = $snrAsset } }
+            $sourceUrl = if ($cand.Kind -eq 'pinned') { $cand.Spec.Url } else { $cand.Cand.Asset.browser_download_url }
+            Invoke-WebRequest -Uri $sourceUrl -OutFile $tmpZip -UseBasicParsing
+            if ($cand.Kind -eq 'pinned') { Expand-7zArchive $tmpZip $tmpDir } else { Expand-ZipSubset $tmpZip '' $tmpDir }
+            $snrDll = Join-Path $tmpDir 'nvngx_dlssnr.dll'
+            if (-not (Test-Path $snrDll)) { throw 'nvngx_dlssnr.dll missing in archive' }
+            $snrHash = Get-FileSha256 $snrDll
+            if ($cand.Kind -eq 'pinned' -and -not (Test-Sha256Pin $snrHash $cand.Spec.Sha256)) {
+                throw "pinned universal DLL SHA-256 mismatch: expected $($cand.Spec.Sha256), got $snrHash"
             }
-            $snrOrder = @($snrCands | Sort-Object -Property @{ Expression = { [version]($_.Version -replace '-[A-Za-z0-9.]+$', '') }; Descending = $true })
-            $snrChecked = @()
-            foreach ($cand in $snrOrder) {
-                $snrZip = Join-Path $env:TEMP "dlssnr-$($cand.Version).zip"
-                $snrDir = Join-Path $env:TEMP "dlssnr-$($cand.Version)"
-                try {
-                    Invoke-WebRequest -Uri $cand.Asset.browser_download_url -OutFile $snrZip -UseBasicParsing
-                    Expand-ZipSubset $snrZip '' $snrDir
-                    $snrDll = Join-Path $snrDir 'nvngx_dlssnr.dll'
-                    $verOk = ConvertTo-ShortVersion (Get-Item $snrDll).VersionInfo.FileVersion
-                    $snrPassed = (Get-DllVerification $snrDll).Accepted
-                    $snrChecked += @{ Tag = $cand.Tag; Version = $verOk; Pass = $snrPassed }
-                    if ($snrPassed) {
-                        $assetArchive = Join-Path $OutDir "nvngx_dlssnr_$($cand.Version).7z"
-                        $snrStage = Join-Path $env:TEMP "dlssnr-stage-$($cand.Version)"
-                        if (Test-Path $snrStage) { Remove-Item $snrStage -Recurse -Force }
-                        New-Item -ItemType Directory -Path $snrStage -Force | Out-Null
-                        Copy-Item $snrDll (Join-Path $snrStage 'nvngx_dlssnr.dll') -Force
-                        New-7zArchive $assetArchive (Join-Path $snrStage '*.dll') | Out-Null
-                        Remove-Item $snrStage -Recurse -Force
-                        $dlssnrNote += "- ``nvngx_dlssnr_$($cand.Version).7z`` (mirror tag ``$($cand.Tag)``): $((Get-DllVerification $snrDll).Label).`n"
-                        break
-                    } else {
-                        Write-Warn2 "dlssnr $($cand.Version) ($($cand.Tag)): rejected because it is not a valid PE image."
-                        $dlssnrNote += "- ``$($cand.Tag)``: not a valid PE image - rejected.`n"
-                    }
-                } catch {
-                    Write-Warn2 "dlssnr candidate $($cand.Tag) failed: $($_.Exception.Message)"
-                    $dlssnrNote += "- ``$($cand.Tag)``: fetch or validation failed ($($_.Exception.Message)).`n"
-                } finally {
-                    if (Test-Path $snrZip) { Remove-Item $snrZip -Force }
-                    if (Test-Path $snrDir) { Remove-Item $snrDir -Recurse -Force }
-                }
+            $verification = Get-DllVerification $snrDll
+            if (-not $verification.Accepted) { throw 'not a valid PE image' }
+            $candVersion = ConvertTo-ShortVersion (Get-Item $snrDll).VersionInfo.FileVersion
+            $stage = Join-Path $env:TEMP ('dlssnr-stage-' + ($cand.Tag -replace '[^A-Za-z0-9.-]', '_'))
+            if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+            New-Item -ItemType Directory -Path $stage -Force | Out-Null
+            Copy-Item $snrDll (Join-Path $stage 'nvngx_dlssnr.dll') -Force
+            $archiveName = if ($cand.Kind -eq 'pinned') { $cand.Spec.AssetName } else { "nvngx_dlssnr_$($cand.Version).7z" }
+            New-7zArchive (Join-Path $OutDir $archiveName) (Join-Path $stage '*.dll') | Out-Null
+            Remove-Item $stage -Recurse -Force
+            if ($cand.Kind -eq 'pinned') {
+                $dlssnrNote += "- ``$archiveName`` (user-pinned universal build, version $candVersion): **$($verification.Label)**; exact DLL SHA-256 ``$snrHash`` matches the immutable pin. Source: ``$($cand.Spec.Source)``.`n"
+                Write-Info "dlssnr: pinned universal build selected (SHA-256 pin verified)."
+            } else {
+                $dlssnrNote += "- ``$archiveName`` (mirror tag ``$($cand.Tag)``): **$($verification.Label)**; DLL SHA-256 ``$snrHash``. Selected as the newest available build.`n"
+                Write-Info "dlssnr: newest mirror build $($cand.Tag) selected (PE-valid)."
             }
-            if (@($snrChecked | Where-Object { $_.Pass }).Count -eq 0) { Write-Info 'No PE dlssnr mirror build available - skipped.' }
+            $snrAccepted = $cand
+            break
         } catch {
-            Write-Warn2 "dlssnr mirror unreachable: $($_.Exception.Message) - skipped."
+            Write-Warn2 "dlssnr candidate $($cand.Tag) rejected: $($_.Exception.Message)"
+            $snrRejected += "- ``$($cand.Tag)``: rejected ($($_.Exception.Message))."
+        } finally {
+            if (Test-Path $tmpZip) { Remove-Item $tmpZip -Force }
+            if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
         }
     }
+    if (-not $snrAccepted) {
+        Write-Warn2 'No usable dlssnr build found - shipping the main set without it.'
+        $dlssnrNote += "- No usable dlssnr build (all candidates rejected).`n"
+    } elseif ($snrAccepted.Kind -eq 'mirror' -and (Compare-OtaNewer $snrAccepted.SortVersion $unverifiedSpec.Version)) {
+        $dlssnrNote += "- The pinned universal build ($($unverifiedSpec.Version)) is still available unchanged; this release ships the newer build above.`n"
+    }
+    foreach ($line in $snrRejected) { $dlssnrNote += "$line`n" }
 }
 if ($dlssnrNote) {
     $dlssnrNotePath = Join-Path $OutDir 'dlssnr-notes.txt'
