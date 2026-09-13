@@ -99,7 +99,11 @@ $OtaCacheRoots = @(
 $OtaCacheRoots = @($OtaCacheRoots | Select-Object -Unique)
 
 if (-not $OutDir) {
-    $downloads = Join-Path $env:USERPROFILE 'Downloads'
+    # $env:USERPROFILE does not exist on Linux/macOS - fall back to $HOME, then temp
+    $homeRoot = if (Test-WindowsHost -and $env:USERPROFILE) { $env:USERPROFILE }
+                elseif ($env:HOME) { $env:HOME }
+                else { Get-TempRoot }
+    $downloads = Join-Path $homeRoot 'Downloads'
     $stamp = Get-Date -Format 'yyyyMMdd-HHmm'
     $OutDir = Join-Path $downloads "nvidia-ota-prerelease-$stamp"
 }

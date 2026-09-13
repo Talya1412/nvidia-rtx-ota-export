@@ -125,6 +125,7 @@ Assert-True 'pe version: no version resource -> empty string' ((Get-FilePeVersio
 Remove-Item $fakePath -Force -ErrorAction SilentlyContinue
 Assert-True 'newest tag: empty list -> null' ($null -eq (Get-NewestReleaseTag @()))
 Assert-True 'newest tag: numeric 310.10 beats 310.9' ((Get-NewestReleaseTag @('v310.10.0-sl2.14.0', 'v310.9.0-sl2.15.0')) -eq 'v310.10.0-sl2.14.0')
+Assert-True 'newest tag: picks max among mixed list' ((Get-NewestReleaseTag @('v310.7.128-sl2.12.128', 'v310.9.0-sl2.14.0', 'v0.1-docs')) -eq 'v310.9.0-sl2.14.0')
 
 Assert-True 'gate: production candidate older than staging release -> skip (regression: stale publish)' (-not (Test-ReleaseTagNewer '310.7.128' '2.12.128' 'v310.9.0-sl2.14.0'))
 Assert-True 'gate: candidate newer than latest -> publish' (Test-ReleaseTagNewer '310.9.0' '2.14.0' 'v310.7.128-sl2.12.128')
@@ -158,6 +159,12 @@ $win3 = Select-ComponentWinners @(
     @{ Source = 'sdk-streamline'; Dlss = '310.9.1'; Sl = '2.14.1' }
 )
 Assert-True 'winners: tie -> SDK preferred (official SDK repo first)' ($win3.DlssSource -eq 'sdk-streamline' -and $win3.SlSource -eq 'sdk-streamline')
+$win4 = Select-ComponentWinners @(@{ Source = 'ota-production'; Dlss = '310.8.0'; Sl = '2.13.0' })
+Assert-True 'winners: single source -> that source' ($win4.DlssSource -eq 'ota-production' -and $win4.SlVersion -eq '2.13.0')
+
+Assert-True 'sdk asset: x64 zip preferred over arch variants' ((Get-SdkZipAssetName @('streamline-sdk-v2.14.1-aarch64.zip', 'streamline-sdk-v2.14.1.zip', 'streamline-sdk-v2.14.1-arm64ec.zip')) -eq 'streamline-sdk-v2.14.1.zip')
+Assert-True 'sdk asset: fallback to any zip' ((Get-SdkZipAssetName @('streamline-2.14.1.zip')) -eq 'streamline-2.14.1.zip')
+Assert-True 'dlssnr: newer PE accepted regardless of signature status' ((Select-DlssnrBuild @(@{ Tag = 'dlssnr-310.9.0-SF'; Version = '310.9.0'; Pass = $true }, @{ Tag = 'dlssnr-310.8.0'; Version = '310.8.0'; Pass = $true })) -eq 'dlssnr-310.9.0-SF')
 
 
 # ---------------------------------------------------------------- driver OTA cache lookup
@@ -181,10 +188,16 @@ try {
 }
 
 # ---------------------------------------------------------------- relaxed PE-only export policy
+$hashMismatch = Get-DllAcceptancePolicy $true 'HashMismatch' 'CN=NVIDIA Corporation'
+Assert-True 'gate: PE with NVIDIA HashMismatch is accepted but labeled UNVERIFIED' ($hashMismatch.Accepted -and $hashMismatch.Label -match 'UNVERIFIED')
+$unsigned = Get-DllAcceptancePolicy $true 'NotSigned' ''
+Assert-True 'gate: PE without Authenticode is accepted but labeled UNVERIFIED' ($unsigned.Accepted -and $unsigned.Label -match 'UNVERIFIED')
 $valid = Get-DllAcceptancePolicy $true 'Valid' 'CN=NVIDIA Corporation'
 Assert-True 'gate: valid NVIDIA signature is accepted and labeled verified' ($valid.Accepted -and $valid.Label -eq 'Valid (NVIDIA)')
 $otherSigner = Get-DllAcceptancePolicy $true 'Valid' 'CN=Some Other Publisher'
 Assert-True 'gate: PE with non-NVIDIA valid signature is still accepted as UNVERIFIED' ($otherSigner.Accepted -and $otherSigner.Label -match 'UNVERIFIED')
+$badPe = Get-DllAcceptancePolicy $false 'Valid' 'CN=NVIDIA Corporation'
+Assert-True 'gate: non-PE is still rejected' (-not $badPe.Accepted)
 
 Assert-True 'pin: exact SHA-256 matches case-insensitively' (Test-Sha256Pin 'ABCDEF0123456789' 'abcdef0123456789')
 Assert-True 'pin: dlssnr asset is a plain 7z name (UNVERIFIED status lives in release notes, not the filename)' ((Get-UnverifiedDlssnrSpec).AssetName -eq 'nvngx_dlssnr_310.8.0.7z')
