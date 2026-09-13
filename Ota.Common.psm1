@@ -429,7 +429,7 @@ function Get-UnverifiedDlssnrSpec {
         Url       = 'https://github.com/Talya1412/nvidia-rtx-ota-export/releases/download/v310.9.1-sl2.14.1/nvngx_dlssnr_310.8.0.7z'
         Sha256    = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
         Version   = '310.8.0'
-        Source    = 'Talya1412/nvidia-rtx-ota-export (user-pinned artifact)'
+        Source    = 'Talya1412/nvidia-rtx-ota-export release asset (user-pinned, self-hosted - NOT an NVIDIA origin)'
     }
 }
 

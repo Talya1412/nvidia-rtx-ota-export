@@ -91,12 +91,17 @@ function Get-ChannelBaseUrl([string]$Ch) {
 
 # Driver's local OTA cache (populated by NVIDIA's own updater, nvngx_update.exe). Probed
 # read-only: registry-declared NGXPath (newer drivers) first, then the two default locations.
-$OtaCacheRoots = @(
-    ((Get-ItemProperty 'HKLM:\SOFTWARE\NVIDIA Corporation\Global\NGXCore' -ErrorAction SilentlyContinue).NGXPath),
-    (Join-Path $env:ProgramData 'NVIDIA\NGX'),
-    (Join-Path $env:APPDATA 'NVIDIA\NGX')
-) | Where-Object { $_ }
-$OtaCacheRoots = @($OtaCacheRoots | Select-Object -Unique)
+if (Test-WindowsHost) {
+    $OtaCacheRoots = @(
+        ((Get-ItemProperty 'HKLM:\SOFTWARE\NVIDIA Corporation\Global\NGXCore' -ErrorAction SilentlyContinue).NGXPath),
+        (Join-Path $env:ProgramData 'NVIDIA\NGX'),
+        (Join-Path $env:APPDATA 'NVIDIA\NGX')
+    ) | Where-Object { $_ }
+    $OtaCacheRoots = @($OtaCacheRoots | Select-Object -Unique)
+} else {
+    # no NGX cache on Linux/macOS (and $env:ProgramData/$env:APPDATA are unset there)
+    $OtaCacheRoots = @()
+}
 
 if (-not $OutDir) {
     # $env:USERPROFILE does not exist on Linux/macOS - fall back to $HOME, then temp
@@ -402,6 +407,7 @@ if ($winners.SlSource -eq 'sdk-streamline') {
         if (-not (Test-SidecarSha256 $tmpSlsdkZip "$slsdkUrl.sha256")) { throw 'sl_sdk_0 payload failed SHA-256 sidecar verification.' }
         # payload entries live under the 160_E658703/ subdirectory (like the SDK zip's bin/x64)
         Expand-ZipSubset $tmpSlsdkZip '160_E658703' $OutDir
+        $baseReady = $true
         Write-Info "$baseChannel sl_sdk_0 payload extracted (SL $slPin, sidecar-verified)."
     } catch {
         Write-Warn2 "$baseChannel sl_sdk_0 payload unavailable: $($_.Exception.Message) - falling back to the dlss_override bundle."
