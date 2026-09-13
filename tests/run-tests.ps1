@@ -169,48 +169,36 @@ Assert-True 'pin: exact SHA-256 matches case-insensitively' (Test-Sha256Pin 'ABC
 Assert-True 'pin: dlssnr asset is a plain 7z name (UNVERIFIED status lives in release notes, not the filename)' ((Get-UnverifiedDlssnrSpec).AssetName -eq 'nvngx_dlssnr_310.8.0.7z')
 Assert-True 'pin: dlssnr asset hash is exact and immutable' ((Get-UnverifiedDlssnrSpec).Sha256 -eq 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a')
 Assert-True 'pin: dlssnr asset has fetchable release URL' ((Get-UnverifiedDlssnrSpec).Url -match '^https://github\.com/Talya1412/nvidia-rtx-ota-export/releases/download/v310\.9\.1-sl2\.14\.1/nvngx_dlssnr_310\.8\.0\.7z$')
-Assert-True 'pinned 7z: Windows entry keeps the exact recorded digest' ((Get-Pinned7zSpec).Win.Sha256 -eq 'ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d')
-$badSpecs = 0
-foreach ($plat in 'Win', 'Linux', 'LinuxArm64', 'Mac') {
-    $s = (Get-Pinned7zSpec)[$plat]
-    if (-not ($s.Url -match '^https://www\.7-zip\.org/a/' -and $s.Sha256 -match '^[0-9a-f]{64}$' -and $s.Size -gt 0 -and $s.Inner)) { $badSpecs++ }
-}
-Assert-True 'pinned 7z: every platform entry is a complete digest spec' ($badSpecs -eq 0)
-Assert-True 'pinned 7z: all platform pins are the same upstream version' (@((Get-Pinned7zSpec).Values | ForEach-Object { $_.Version } | Select-Object -Unique).Count -eq 1)
+Assert-True 'pinned 7z: official standalone console build URL' ((Get-Pinned7zrSpec).Url -eq 'https://www.7-zip.org/a/7zr.exe')
+Assert-True 'pinned 7z: SHA-256 pin is the exact recorded digest' ((Get-Pinned7zrSpec).Sha256 -eq 'ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d')
 Assert-True 'pinned 7z: resolver is exported' ($null -ne (Get-Command Resolve-7ZipTool -ErrorAction SilentlyContinue))
-Assert-True 'platform: detector returns a known platform' (@('Win','Linux','LinuxArm64','Mac') -contains (Get-CurrentPlatform))
 
-# ---------------------------------------------------------------- multi-feed expansion (git-protocol sources)
-# Mirror candidates are built from raw git tags (git ls-remote output, refs/tags/ prefix already
-# stripped) - asset names and download URLs are deterministic, so no GitHub API is involved.
-$mockRhiTags = @(
-    'renodx-dlss5-5.2.1',
-    'dlss-310.9.1',
-    'dlss-310.9.0',
-    'dlssd-310.9.1',
-    'dlssg-310.9.1',
-    'streamline-2.14.1.0',
-    'streamline-2.14.0.0',
-    'dlssnr-310.9.0',
-    'dlssnr-310.8.0-RTX40',
-    'dlssnr-310.8.SF',
-    'DLSS-Enabler-4.10.0'
+# ---------------------------------------------------------------- multi-feed expansion (new sources)
+$mockRhi = @(
+    @{ tag_name = 'renodx-dlss5-5.2.1';   assets = @(@{ name = 'renodx-dlss5_5.2.1.zip' }) },
+    @{ tag_name = 'dlss-310.9.1';         assets = @(@{ name = 'nvngx_dlss_310.9.1.zip' }) },
+    @{ tag_name = 'dlss-310.9.0';         assets = @(@{ name = 'nvngx_dlss_310.9.0.zip' }) },
+    @{ tag_name = 'dlssd-310.9.1';        assets = @(@{ name = 'nvngx_dlssd_310.9.1.zip' }) },
+    @{ tag_name = 'dlssg-310.9.1';        assets = @(@{ name = 'nvngx_dlssg_310.9.1.zip' }) },
+    @{ tag_name = 'streamline-2.14.1.0';  assets = @(@{ name = 'streamline_2.14.1.0.zip' }) },
+    @{ tag_name = 'streamline-2.14.0.0';  assets = @(@{ name = 'streamline_2.14.0.0.zip' }) },
+    @{ tag_name = 'dlssnr-310.9.0';       assets = @(@{ name = 'nvngx_dlssnr_310.9.0.zip' }) },
+    @{ tag_name = 'dlssnr-310.8.0-RTX40'; assets = @(@{ name = 'nvngx_dlssnr_310.8.0-RTX40.zip' }) },
+    @{ tag_name = 'dlssnr-310.8.SF';      assets = @(@{ name = 'nvngx_dlssnr_310.8.SF.zip' }) },
+    @{ tag_name = 'DLSS-Enabler-4.10.0';  assets = @(@{ name = 'DLSS-Enabler-4.10.0.zip' }) }
 )
-$mDlss = @(Get-RhiMirrorBuilds $mockRhiTags 'dlss')
+$mDlss = @(Get-RhiMirrorBuilds $mockRhi 'dlss')
 Assert-True 'mirror: dlss newest first, unrelated prefixes filtered' ($mDlss.Count -eq 2 -and $mDlss[0].Version -eq '310.9.1' -and $mDlss[0].Tag -eq 'dlss-310.9.1')
 Assert-True 'mirror: dlss asset name mapping' ($mDlss[0].AssetName -eq 'nvngx_dlss_310.9.1.zip')
-Assert-True 'mirror: download url is deterministic (no API asset lookup)' ($mDlss[0].DownloadUrl -eq 'https://github.com/RankFTW/rhi-repo/releases/download/dlss-310.9.1/nvngx_dlss_310.9.1.zip')
-Assert-True 'mirror: dlssd section isolated' ((@(Get-RhiMirrorBuilds $mockRhiTags 'dlssd'))[0].AssetName -eq 'nvngx_dlssd_310.9.1.zip')
-Assert-True 'mirror: streamline 4-part version' ((@(Get-RhiMirrorBuilds $mockRhiTags 'streamline'))[0].Version -eq '2.14.1.0')
-$snrM = @(Get-RhiMirrorBuilds $mockRhiTags 'dlssnr')
+Assert-True 'mirror: dlssd section isolated' ((@(Get-RhiMirrorBuilds $mockRhi 'dlssd'))[0].AssetName -eq 'nvngx_dlssd_310.9.1.zip')
+Assert-True 'mirror: streamline 4-part version' ((@(Get-RhiMirrorBuilds $mockRhi 'streamline'))[0].Version -eq '2.14.1.0')
+$snrM = @(Get-RhiMirrorBuilds $mockRhi 'dlssnr')
 Assert-True 'mirror: dlssnr suffix-tolerant, newest first (non-numeric suffix tag skipped)' ($snrM.Count -eq 2 -and $snrM[0].Version -eq '310.9.0' -and $snrM[1].Version -eq '310.8.0-RTX40')
 Assert-True 'mirror: dlssnr asset keeps full version incl. suffix' ($snrM[1].AssetName -eq 'nvngx_dlssnr_310.8.0-RTX40.zip')
-Assert-True 'mirror: unknown section -> empty' (@(Get-RhiMirrorBuilds $mockRhiTags 'nosuch').Count -eq 0)
-Assert-True 'git tags: refs/tags/ prefix and peeled ^{} entries are stripped' ((Get-GitTags @("abc1`trefs/tags/dlss-310.9.1", "abc2`trefs/tags/dlss-310.9.0^{}")) -join ',' -eq 'dlss-310.9.1,dlss-310.9.0')
+Assert-True 'mirror: unknown section -> empty' (@(Get-RhiMirrorBuilds $mockRhi 'nosuch').Count -eq 0)
 
-Assert-True 'sdk url: tag -> deterministic streamline-sdk asset' ((Get-SdkDownloadUrl 'v2.14.1') -eq 'https://github.com/NVIDIA-RTX/Streamline/releases/download/v2.14.1/streamline-sdk-v2.14.1.zip')
-Assert-True 'dlss url: tag -> fixed demo windows asset' ((Get-DlssDemoUrl 'v310.9.1') -eq 'https://github.com/NVIDIA/DLSS/releases/download/v310.9.1/ngx_dlss_demo_windows.zip')
-Assert-True 'tag version: v-prefix stripped, non-release -> null' ((ConvertFrom-TagVersion 'v310.9.1') -eq '310.9.1' -and $null -eq (ConvertFrom-TagVersion 'renodx-dlss5-5.2.1'))
+Assert-True 'dlss repo asset: demo windows picked' ((Get-DlssRepoAssetName @('ngx_dlss_demo_linux.zip', 'ngx_dlss_demo_windows.zip')) -eq 'ngx_dlss_demo_windows.zip')
+Assert-True 'dlss repo asset: no windows asset -> null' ($null -eq (Get-DlssRepoAssetName @('ngx_dlss_demo_linux.zip')))
 
 $probeLive = [pscustomobject]@{ stagingDlss = '310.9.0'; stagingSl = '2.14.0'; productionDlss = '310.7.128'; productionSl = '2.12.128'; sdkTag = 'v2.14.1'; dlssRepoTag = 'v310.9.1'; dlssnrMirrorMax = '310.8.0' }
 Assert-True 'probe: identical state -> no diff' (-not (Test-ProbeStateDiffers $probeLive $probeLive))

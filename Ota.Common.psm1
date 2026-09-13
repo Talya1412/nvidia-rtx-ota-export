@@ -100,87 +100,78 @@ function Select-ComponentWinners([object[]]$Candidates) {
 # rhi-repo mirror builds for one section: newest-first candidates @{ Tag; Version; AssetName }.
 # Only tags matching "<prefix>-<version>" count - community variants (renodx-*, DLSS-Enabler-*)
 # are deliberately NOT sources. Version keeps its full tag remainder (suffixes like -RTX40 stay
-# ---------------------------------------------------------------- pinned 7-Zip tool (per platform)
-# Official standalone console builds, one pinned entry per OS/arch we support. Upstream does not
-# Authenticode-sign these binaries, so the SHA-256 pin is the integrity control: every use
-# (fresh download or cached copy) is verified against the pin before execution. Update procedure:
-# download each artifact from https://www.7-zip.org/a/, confirm the source, then bump every
-# entry's Version + Size + Sha256 together in a single commit.
-function Get-Pinned7zSpec {
-    return @{
-        Win        = @{ Url = 'https://www.7-zip.org/a/7zr.exe';                 Sha256 = 'ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d'; Size = 602624;   Kind = 'exe';   Inner = '7zr.exe'; Version = '26.03' }
-        Linux      = @{ Url = 'https://www.7-zip.org/a/7z2603-linux-x64.tar.xz';   Sha256 = 'dc99eff5008f1ab79bd7084c68513701547a808a89502bf4133683535ab3c695'; Size = 1575072; Kind = 'tarxz'; Inner = '7zz';     Version = '26.03' }
-        LinuxArm64 = @{ Url = 'https://www.7-zip.org/a/7z2603-linux-arm64.tar.xz'; Sha256 = '2389ba20e4d8295e8709c20b6263b69bd1ec4972fe38a04ad7a1badbf595b996'; Size = 1328620; Kind = 'tarxz'; Inner = '7zz';     Version = '26.03' }
-        Mac        = @{ Url = 'https://www.7-zip.org/a/7z2603-mac.tar.xz';         Sha256 = '5ca87677072c59f5602e5c49baa27d4694bacd2259b4e507f0094249d4281480'; Size = 1863192; Kind = 'tarxz'; Inner = '7zz';     Version = '26.03' }
+# in the asset name); sorting uses the numeric prefix, and list order (GitHub API: newest first)
+# breaks ties. Tags whose numeric prefix does not parse (e.g. dlssnr-310.8.SF) are skipped.
+function Get-RhiMirrorBuilds([object[]]$Releases, [string]$Section) {
+    $map = @{
+        'dlss'       = @{ TagPrefix = 'dlss-';       AssetPrefix = 'nvngx_dlss_' }
+        'dlssd'      = @{ TagPrefix = 'dlssd-';      AssetPrefix = 'nvngx_dlssd_' }
+        'dlssg'      = @{ TagPrefix = 'dlssg-';      AssetPrefix = 'nvngx_dlssg_' }
+        'streamline' = @{ TagPrefix = 'streamline-'; AssetPrefix = 'streamline_' }
+        'dlssnr'     = @{ TagPrefix = 'dlssnr-';     AssetPrefix = 'nvngx_dlssnr_' }
     }
+    if (-not $map.ContainsKey($Section)) { return @() }
+    $tagPrefix = $map[$Section].TagPrefix
+    $assetPrefix = $map[$Section].AssetPrefix
+    $cands = @()
+    $order = 0
+    foreach ($r in @($Releases)) {
+        $order++
+        if (-not $r -or -not $r.tag_name -or -not $r.tag_name.StartsWith($tagPrefix)) { continue }
+        $version = $r.tag_name.Substring($tagPrefix.Length)
+        if (-not $version) { continue }
+        $sortVersion = $version
+        try { $null = [version]$sortVersion } catch {
+            $sortVersion = $version -replace '-[A-Za-z0-9.]+$', ''
+            try { $null = [version]$sortVersion } catch { continue }
+        }
+        $assetName = "$assetPrefix$version.zip"
+        $asset = @($r.assets) | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+        if (-not $asset) { continue }
+        $cands += @{ Tag = $r.tag_name; Version = $version; SortVersion = $sortVersion; AssetName = $assetName; Asset = $asset; Order = $order }
+    }
+    # callers wrap with @() (PowerShell convention): single-element lists unroll to a bare
+    # hashtable across the pipeline, so [0]/.Count at a caller only work on the wrapped value
+    return @($cands | Sort-Object -Property @{ Expression = { [version]$_.SortVersion }; Descending = $true },
+                               @{ Expression = { $_.Order } })
 }
 
-# Works on Windows PowerShell 5.1 (.NET Framework 4.7.1+) and PowerShell 7.
-function Get-CurrentPlatform {
-    $ri = [System.Runtime.InteropServices.RuntimeInformation]
-    if ($ri::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) { return 'Win' }
-    if ($ri::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) { return 'Mac' }
-    if ($ri::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)) {
-        if ($ri::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) { return 'LinuxArm64' }
-        return 'Linux'
-    }
-    throw 'Unsupported OS platform.'
+# The NVIDIA/DLSS GitHub release asset carrying the runtime demo + DLLs (Windows build only).
+function Get-DlssRepoAssetName([string[]]$AssetNames) {
+    $win = @($AssetNames) | Where-Object { $_ -match '^ngx_dlss_demo_windows\.zip$' } | Select-Object -First 1
+    if ($win) { return $win }
+    return (@($AssetNames) | Where-Object { $_ -match 'demo_windows.*\.zip$' } | Select-Object -First 1)
 }
 
-# Trusted local installs first; otherwise the hash-pinned official build for the current
-# platform. Windows uses 7zr.exe directly; Linux/macOS download the official tarball, verify the
-# pin, extract with the system tar (which every supported distro ships) and run the inner 7zz.
-# A cached copy is re-verified on every call; any mismatch aborts instead of running unverified code.
-function Resolve-7ZipTool {
-    $platform = Get-CurrentPlatform
-    if ($platform -eq 'Win') {
-        $local = @()
-        foreach ($cmd in '7z', '7zr') {
-            $c = Get-Command $cmd -ErrorAction SilentlyContinue
-            if ($c) { $local += $c.Source }
-        }
-        foreach ($p in @("$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe",
-                         "$env:ProgramFiles\NVIDIA Corporation\NVIDIA App\7z.exe")) {
-            if (Test-Path $p) { $local += $p }
-        }
-        foreach ($p in $local) { if ($p) { return $p } }
-    } else {
-        foreach ($cmd in '7zz', '7zr', '7z') {
-            $c = Get-Command $cmd -ErrorAction SilentlyContinue
-            if ($c) { return $c.Source }
-        }
+# Cheap pre-gate: true when the live multi-feed probe differs from the stored probe state
+# (probe-state.json attached to the newest release). $null/$empty pairs compare equal, and a
+# missing stored state counts as a difference so the first run always bootstraps a full export.
+function Test-ProbeStateDiffers($Live, $Stored) {
+    if (-not $Stored) { return $true }
+    foreach ($p in 'stagingDlss', 'stagingSl', 'productionDlss', 'productionSl', 'sdkTag', 'dlssRepoTag', 'dlssnrMirrorMax') {
+        $l = [string]$Live.$p
+        $s = [string]$Stored.$p
+        if ($l -ne $s -and -not (([string]::IsNullOrEmpty($l)) -and ([string]::IsNullOrEmpty($s)))) { return $true }
     }
-
-    $spec = (Get-Pinned7zSpec)[$platform]
-    $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) "7z-pinned-$platform"
-    if ($spec.Kind -eq 'exe') {
-        $tool = Join-Path $tmpRoot $spec.Inner
-        if (-not (Test-Path $tool) -or (Get-Item $tool).Length -ne $spec.Size) {
-            New-Item -ItemType Directory $tmpRoot -Force | Out-Null
-            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $spec.Url -OutFile $tool -UseBasicParsing
-        }
-    } else {
-        $tarball = Join-Path $tmpRoot ([System.IO.Path]::GetFileName($spec.Url))
-        $tool = Join-Path $tmpRoot $spec.Inner
-        if (-not (Test-Path $tool) -or -not (Test-Path $tarball) -or (Get-Item $tarball).Length -ne $spec.Size) {
-            New-Item -ItemType Directory $tmpRoot -Force | Out-Null
-            Invoke-WebRequest -Uri $spec.Url -OutFile $tarball -UseBasicParsing
-            if (-not (Test-Sha256Pin (Get-FileSha256 $tarball) $spec.Sha256)) {
-                Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
-                throw "Pinned 7-Zip tarball failed SHA-256 verification: expected $($spec.Sha256) - refusing to extract or execute."
-            }
-            tar -xf $tarball -C $tmpRoot
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tool)) { throw "Failed to extract the pinned 7-Zip tarball (system 'tar' missing or unreadable?): $tarball" }
-        }
-    }
-    $actual = Get-FileSha256 $tool
-    if (-not (Test-Sha256Pin $actual $spec.Sha256) -and $spec.Kind -ne 'tarxz') {
-        Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
-        throw "Pinned 7-Zip tool failed SHA-256 verification: expected $($spec.Sha256), got $actual - refusing to execute."
-    }
-    return $tool
+    return $false
 }
+
+# The x64 Streamline SDK zip asset: streamline-sdk-v<ver>.zip (excludes -aarch64/-arm64ec).
+# Falls back to the first zip when NVIDIA renames assets.
+function Get-SdkZipAssetName([string[]]$AssetNames) {
+    $x64 = @($AssetNames) | Where-Object { $_ -match '^streamline-sdk-v[0-9.]+\.zip$' } | Select-Object -First 1
+    if ($x64) { return $x64 }
+    return (@($AssetNames) | Where-Object { $_ -match '\.zip$' } | Select-Object -First 1)
+}
+
+# 'v310.9.0-sl2.14.0' -> Dlss='310.9.0', Sl='2.14.0'; anything else -> $null
+function Get-ReleaseTagVersion([string]$Tag) {
+    if ($Tag -notmatch '^v(\d+(?:\.\d+)+)-sl(\d+(?:\.\d+)+)$') { return $null }
+    return [pscustomobject]@{ Dlss = $Matches[1]; Sl = $Matches[2] }
+}
+
+# Among candidate release tags, the one with the highest (Dlss, Sl) tuple; $null when none parse.
+function Get-NewestReleaseTag([string[]]$Tags) {
     $best = $null; $bestV = $null
     foreach ($t in @($Tags)) {
         if (-not $t) { continue }
