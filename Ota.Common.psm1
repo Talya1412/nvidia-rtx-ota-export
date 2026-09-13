@@ -421,7 +421,8 @@ function Expand-7zArchive([string]$ArchivePath, [string]$DestDir) {
     if ($LASTEXITCODE -ne 0) { throw "7z extraction failed (exit $LASTEXITCODE): $ArchivePath" }
 }
 
-# Extracts only top-level *.dll entries under EntryPrefix; path separators / '..' in the remainder are rejected (zip-slip). Returns the extracted file names.
+# Extracts only top-level *.dll entries under EntryPrefix; remainders containing a path separator
+# are skipped and the resolved target must stay under DestDir (zip-slip). Returns the extracted names.
 function Expand-ZipSubset([string]$ZipPath, [string]$EntryPrefix, [string]$DestDir) {
     New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
     $destFull = [System.IO.Path]::GetFullPath((Resolve-Path $DestDir).ProviderPath).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
@@ -432,7 +433,7 @@ function Expand-ZipSubset([string]$ZipPath, [string]$EntryPrefix, [string]$DestD
         foreach ($e in $z.Entries) {
             if (-not $e.FullName.StartsWith($prefix)) { continue }
             $rest = $e.FullName.Substring($prefix.Length)
-            if ($rest.Contains('/') -or $rest.Contains('\') -or $rest.Contains('..') -or -not $rest.EndsWith('.dll')) { continue }
+            if ($rest.Contains('/') -or $rest.Contains('\') -or -not $rest.EndsWith('.dll')) { continue }
             $target = [System.IO.Path]::GetFullPath((Join-Path $destFull $rest))
             if (-not $target.StartsWith($destFull, [System.StringComparison]::OrdinalIgnoreCase)) { throw "zip entry escapes destination: $($e.FullName)" }
             [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $target, $true)
