@@ -384,8 +384,8 @@ if ($winners.SlSource -eq 'sdk-streamline') {
     try {
         Invoke-WebRequest -Uri $slsdkUrl -OutFile $tmpSlsdkZip -UseBasicParsing
         if (-not (Test-SidecarSha256 $tmpSlsdkZip "$slsdkUrl.sha256")) { throw 'sl_sdk_0 payload failed SHA-256 sidecar verification.' }
-        Expand-ZipSubset $tmpSlsdkZip '' $OutDir
-        $baseReady = $true
+        # payload entries live under the 160_E658703/ subdirectory (like the SDK zip's bin/x64)
+        Expand-ZipSubset $tmpSlsdkZip '160_E658703' $OutDir
         Write-Info "$baseChannel sl_sdk_0 payload extracted (SL $slPin, sidecar-verified)."
     } catch {
         Write-Warn2 "$baseChannel sl_sdk_0 payload unavailable: $($_.Exception.Message) - falling back to the dlss_override bundle."
@@ -414,6 +414,12 @@ if ($winners.SlSource -eq 'sdk-streamline') {
     }
 }
 # DLSS fix-up: the DLSS winner's DLLs overlay the base set whenever they come from another source
+
+# invariant: the base set must contain the SL winner's runtime - a silently empty base set
+# (e.g. an extraction that matched no entries) would otherwise ship a half-valid export
+if (-not (Test-Path (Join-Path $OutDir 'sl.common.dll'))) {
+    throw 'Base set incomplete: sl.common.dll missing after SL payload composition.'
+}
 if ($winners.DlssSource -eq 'sdk-streamline' -and $winners.SlSource -ne 'sdk-streamline') {
     foreach ($dll in 'nvngx_dlss.dll', 'nvngx_dlssd.dll', 'nvngx_dlssg.dll') {
         Copy-Item (Join-Path $sdkSource.Dir $dll) (Join-Path $OutDir $dll) -Force
