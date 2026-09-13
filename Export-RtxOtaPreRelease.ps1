@@ -63,7 +63,6 @@ $ChannelRoots = @{
     Production = '3e933c08-ea30-45ae-93d1-5114edf9c3b9'
 }
 $ManifestPath = 'config/versions/2/files/nvngx_server_config.txt'
-$SignerPattern = 'NVIDIA Corporation'
 $GenericPayload = '160_E658700'
 function Get-GitHubJson([string]$ApiPath) {
     # gh CLI (authenticated, 5000/h) when available; plain unauth REST (60/h per IP) otherwise.

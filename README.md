@@ -22,9 +22,9 @@ export-summary.txt  per-file version + signature status + SHA-256
 export-sources.txt  which feed won each component (dlss=/sl=) + all feeds compared
 ```
 
-> `Newest` also packages DLSS 5 Neural Rendering as a separate per-GPU asset. The universal build
-> is accepted only when its exact SHA-256 pin matches; its Authenticode status is reported as
-> **UNVERIFIED**. Core DLSS/Streamline signatures are reported, not used as a hard reject.
+> `Newest` also packages DLSS 5 Neural Rendering as a separate per-GPU asset. The universal
+> `nvngx_dlssnr-universal-310.8.0-UNVERIFIED.zip` is accepted only when its exact SHA-256 pin
+> matches; signatures for allowlisted DLSS/Streamline DLLs are reported, not hard rejects.
 
 ## Automated releases
 
