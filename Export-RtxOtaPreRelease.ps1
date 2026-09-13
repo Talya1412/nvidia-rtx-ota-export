@@ -91,12 +91,17 @@ function Get-ChannelBaseUrl([string]$Ch) {
 
 # Driver's local OTA cache (populated by NVIDIA's own updater, nvngx_update.exe). Probed
 # read-only: registry-declared NGXPath (newer drivers) first, then the two default locations.
-$OtaCacheRoots = @(
-    ((Get-ItemProperty 'HKLM:\SOFTWARE\NVIDIA Corporation\Global\NGXCore' -ErrorAction SilentlyContinue).NGXPath),
-    (Join-Path $env:ProgramData 'NVIDIA\NGX'),
-    (Join-Path $env:APPDATA 'NVIDIA\NGX')
-) | Where-Object { $_ }
-$OtaCacheRoots = @($OtaCacheRoots | Select-Object -Unique)
+if (Test-WindowsHost) {
+    $OtaCacheRoots = @(
+        ((Get-ItemProperty 'HKLM:\SOFTWARE\NVIDIA Corporation\Global\NGXCore' -ErrorAction SilentlyContinue).NGXPath),
+        (Join-Path $env:ProgramData 'NVIDIA\NGX'),
+        (Join-Path $env:APPDATA 'NVIDIA\NGX')
+    ) | Where-Object { $_ }
+    $OtaCacheRoots = @($OtaCacheRoots | Select-Object -Unique)
+} else {
+    # no NGX cache on Linux/macOS (and $env:ProgramData/$env:APPDATA are unset there)
+    $OtaCacheRoots = @()
+}
 
 if (-not $OutDir) {
     # $env:USERPROFILE does not exist on Linux/macOS - fall back to $HOME, then temp
@@ -205,20 +210,6 @@ function Get-OtaChannelState([string]$Ch) {
     return $o
 }
 
-function Expand-ZipSubset([string]$ZipPath, [string]$EntryPrefix, [string]$DestDir) {
-    New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
-    $prefix = if ($EntryPrefix) { $EntryPrefix.Trim('/') + '/' } else { '' }
-    $z = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
-    try {
-        foreach ($e in $z.Entries) {
-            if (-not $e.FullName.StartsWith($prefix)) { continue }
-            $rest = $e.FullName.Substring($prefix.Length)
-            if ($rest.Contains('/') -or -not $rest.EndsWith('.dll')) { continue }
-            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path $DestDir $rest), $true)
-        }
-    } finally { $z.Dispose() }
-}
-
 $ota = @{}
 if ($wantStaging)    { $s = Get-OtaChannelState 'Staging';    if ($s) { $ota['Staging'] = $s } }
 if ($wantProduction) { $s = Get-OtaChannelState 'Production'; if ($s) { $ota['Production'] = $s } }
@@ -237,7 +228,7 @@ if ($wantSdk) {
         $tmpSdkDir = Join-Path (Get-TempRoot) 'streamline-sdk-latest'
         if (Test-Path $tmpSdkDir) { Remove-Item $tmpSdkDir -Recurse -Force }
         Invoke-WebRequest -Uri $sdkUrl -OutFile $tmpSdkZip -UseBasicParsing
-        Expand-ZipSubset $tmpSdkZip 'bin/x64' $tmpSdkDir
+        Expand-ZipSubset $tmpSdkZip 'bin/x64' $tmpSdkDir | Out-Null
         Remove-Item $tmpSdkZip -Force
         $sdkSource = @{
             Tag  = $sdkTag
@@ -265,7 +256,7 @@ if ($wantDlssRepo) {
         $tmpDemoDir = Join-Path (Get-TempRoot) 'dlss-demo-latest'
         if (Test-Path $tmpDemoDir) { Remove-Item $tmpDemoDir -Recurse -Force }
         Invoke-WebRequest -Uri $demoUrl -OutFile $tmpDemoZip -UseBasicParsing
-        Expand-ZipSubset $tmpDemoZip 'DLSS_Sample_App/bin/ngx_dlss_demo' $tmpDemoDir
+        Expand-ZipSubset $tmpDemoZip 'DLSS_Sample_App/bin/ngx_dlss_demo' $tmpDemoDir | Out-Null
         Remove-Item $tmpDemoZip -Force
         $dlssRepo = @{
             Tag  = $dlssTag
@@ -339,7 +330,7 @@ function Get-MirrorDll([object[]]$Candidates, [string]$DllName, [string]$Trusted
         $tmpDir = Join-Path (Get-TempRoot) "mirror-$($cand.Tag)"
         try {
             Invoke-WebRequest -Uri $cand.DownloadUrl -OutFile $tmpZip -UseBasicParsing
-            Expand-ZipSubset $tmpZip '' $tmpDir
+            Expand-ZipSubset $tmpZip '' $tmpDir | Out-Null
             $dll = Join-Path $tmpDir $DllName
             if (-not (Test-Path $dll)) {
                 Write-Warn2 "mirror $($cand.Tag): $DllName missing in archive."
@@ -401,7 +392,8 @@ if ($winners.SlSource -eq 'sdk-streamline') {
         Invoke-WebRequest -Uri $slsdkUrl -OutFile $tmpSlsdkZip -UseBasicParsing
         if (-not (Test-SidecarSha256 $tmpSlsdkZip "$slsdkUrl.sha256")) { throw 'sl_sdk_0 payload failed SHA-256 sidecar verification.' }
         # payload entries live under the 160_E658703/ subdirectory (like the SDK zip's bin/x64)
-        Expand-ZipSubset $tmpSlsdkZip '160_E658703' $OutDir
+        $baseReady = Expand-SlSdkPayload $tmpSlsdkZip $OutDir
+        if (-not $baseReady) { throw 'sl_sdk_0 payload contained no sl.common.dll under 160_E658703/.' }
         Write-Info "$baseChannel sl_sdk_0 payload extracted (SL $slPin, sidecar-verified)."
     } catch {
         Write-Warn2 "$baseChannel sl_sdk_0 payload unavailable: $($_.Exception.Message) - falling back to the dlss_override bundle."
@@ -528,7 +520,7 @@ if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
         try {
             $sourceUrl = if ($cand.Kind -eq 'pinned') { $cand.Spec.Url } else { $cand.Cand.DownloadUrl }
             Invoke-WebRequest -Uri $sourceUrl -OutFile $tmpZip -UseBasicParsing
-            if ($cand.Kind -eq 'pinned') { Expand-7zArchive $tmpZip $tmpDir } else { Expand-ZipSubset $tmpZip '' $tmpDir }
+            if ($cand.Kind -eq 'pinned') { Expand-7zArchive $tmpZip $tmpDir } else { Expand-ZipSubset $tmpZip '' $tmpDir | Out-Null }
             $snrDll = Join-Path $tmpDir 'nvngx_dlssnr.dll'
             if (-not (Test-Path $snrDll)) { throw 'nvngx_dlssnr.dll missing in archive' }
             $snrHash = Get-FileSha256 $snrDll

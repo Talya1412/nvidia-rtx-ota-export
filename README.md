@@ -31,9 +31,10 @@ export-sources.txt  which feed won each component (dlss=/sl=) + all feeds compar
 ```
 
 > `Newest` also packages DLSS 5 Neural Rendering as a separate per-GPU 7z asset (`nvngx_dlssnr_310.8.0.7z`):
-> the pinned universal build is accepted only when its exact DLL SHA-256 matches; its UNVERIFIED
-> Authenticode status is documented in the release notes. Authenticode status for allowlisted
-> DLSS/Streamline DLLs is reported, not used as a hard reject.
+> the pinned universal build is a user-supplied binary hosted as an asset of **this repository's own
+> releases** (not an NVIDIA feed), and is accepted only when its exact DLL SHA-256 matches; its
+> UNVERIFIED Authenticode status is documented in the release notes. Authenticode status for
+> allowlisted DLSS/Streamline DLLs is reported, not used as a hard reject.
 
 ## Automated releases
 
@@ -131,7 +132,8 @@ SDK — three independent origins agreeing on the same production bytes.
   `Valid (NVIDIA)` or `UNVERIFIED (...)`, but it is not a hard reject for allowlisted
   DLSS/Streamline sources. OTA payloads still require NVIDIA's SHA-256 sidecar.
 - **dlssnr ships newest-wins**: the user-pinned universal build (immutable SHA-256 `e67dee20…`,
-  310.8.0) races the rhi-repo `dlssnr-*` mirror builds; the newest PE-valid candidate is packaged.
+  310.8.0) is hosted as an asset of this repo's own releases (user-supplied, not an NVIDIA feed)
+  and races the rhi-repo `dlssnr-*` mirror builds; the newest PE-valid candidate is packaged.
   A pinned-universal failure falls through to mirrors automatically. All archives ship as **7z**;
   the UNVERIFIED Authenticode status of these builds is documented in the release notes and
   `dlssnr-notes.txt`, not in the filename.
@@ -143,11 +145,11 @@ SDK — three independent origins agreeing on the same production bytes.
 - 7-Zip itself is supply-chain controlled: trusted local installs are used when present;
   otherwise the official standalone `7zr.exe` is downloaded from `7-zip.org` and verified against
   an exact SHA-256 pin (`Get-Pinned7zrSpec`) before any execution — a mismatched binary is refused.
-- Requires Windows 10/11 with an NVIDIA GPU (PE validation; signatures are reported, not required) and internet access.
+- Requires Windows PowerShell 5.1 or PowerShell 7 (Windows/Linux/macOS) and internet access. No GPU is needed. Authenticode status is only available on Windows; on Linux/macOS every DLL is reported as `UNVERIFIED (Unavailable (non-Windows))` and only the PE gate plus (for OTA payloads) the SHA-256 sidecar apply.
 - Endpoint provenance and the payload-layout reverse engineering draw on
   [scubamount/dlss-version-toolkit](https://github.com/scubamount/dlss-version-toolkit) (Apache-2.0).
 
 ## Disclaimer
 
 Downloaded DLLs are NVIDIA-copyrighted binaries fetched from NVIDIA's own CDN for personal use on
-your own machine. This repository contains no binaries — only the automation script.
+your own machine. The repository source tree contains no binaries — only the automation scripts; the Releases tab hosts the exported archives.
