@@ -93,24 +93,31 @@ Or double-click `run-export.bat`.
    newest one (ties prefer the Streamline SDK repo). DLSS 5 Neural Rendering also comes from the
    user-pinned universal asset when its exact SHA-256 matches; Authenticode status is reported,
    not used as a hard reject for allowlisted DLSS/Streamline sources or mirror candidates.
-2. **Resolve versions** — OTA: reads `app_E658700` / `app_E658703` generic app pins for sections
-   `dlss`, `dlssd`, `dlssg`, `dlss_override` (the Streamline bundle); SDK: reads the DLL
-   FileVersions inside the Streamline SDK zip (`bin/x64`, production flavor).
-3. **Download + verify** — pulls `dlss_override/versions/<packed>/files/160_E658700.zip`
-   per OTA channel and the `streamline-sdk-v*.zip` asset, then composes the export: the
-   SL winner's full set as base, DLSS DLLs overwritten from the DLSS winner, and a raw `.bin`
-   refresh whenever any OTA manifest pin is strictly newer than an exported DLL. OTA payloads
-   are checked against NVIDIA's published `.sha256` sidecars.
-   Packed version layout: `(major << 16) | (minor << 8) | patch` — e.g. 310.9.0 → 20318464.
+2. **Resolve versions** — OTA: reads `app_E658700` / `app_E658703` pins for sections `dlss`,
+   `dlssd`, `dlssg`, `dlss_override` and `sl_sdk_0`; the `sl_sdk_0` pin carries the real
+   Streamline runtime version, so the SL race runs on manifest pins and only the winning
+   channel's payload is ever downloaded. SDK: reads the DLL FileVersions inside the Streamline
+   SDK zip (`bin/x64`, production flavor).
+3. **Download + verify** — the SL winner's payload becomes the base set: the winning OTA
+   channel's `sl_sdk_0` payload (`160_E658703.zip`, ~10 MB, `.sha256`-sidecar-verified; its
+   `sl.*` DLLs are byte-identical to the heavy `dlss_override` bundle, which stays as fallback)
+   or the `streamline-sdk-v*.zip` asset. DLSS DLLs are overlaid from the DLSS winner, and a raw
+   `.bin` refresh fires whenever an OTA manifest pin is strictly newer than an exported DLL.
+   Every OTA payload is checked against NVIDIA's published `.sha256` sidecar; the base set must
+   contain `sl.common.dll` or the run fails (no half-valid exports).
+   Packed version layout: `(major << 16) | (minor << 8) | patch` — e.g. 310.9.0 → 20318464,
+   2.14.0 → 134656.
 4. **PE gate + signature report** — every exported file must be a valid PE/MZ image. Authenticode
    status is recorded (`Valid (NVIDIA)` or `UNVERIFIED (...)`), but `Valid` is not required for
    allowlisted DLSS/Streamline sources. OTA payloads still require the NVIDIA SHA-256 sidecar.
 5. **Output + optional archive** — writes `export-summary.txt` / `export-sources.txt` and, with
    `-Archive`, a ready-to-share flat **7z** (same layout as the release asset).
-
 Verified live 2026-09-13: Streamline SDK (GitHub) served DLSS 310.9.1 + Streamline 2.14.1 while
 OTA staging served 310.9.0 / 2.14.0 and OTA production 310.7.128 / 2.12.128 — the export takes
-310.9.1 / 2.14.1 and publishes `v310.9.1-sl2.14.1`.
+310.9.1 / 2.14.1 and publishes `v310.9.1-sl2.14.1`. The same day: the OTA `sl_sdk_0` payload
+proved sidecar-verifiable on both channels with `sl.*` bytes identical to the bundle, and the
+NVIDIA/DLSS `ngx_dlss_demo_windows.zip` carried `nvngx_dlss.dll` 310.9.1 bit-identical to the
+SDK — three independent origins agreeing on the same production bytes.
 
 ## Notes
 
