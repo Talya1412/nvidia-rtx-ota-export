@@ -1,7 +1,8 @@
 name: ci
 
-# PR/push gate for the shared OTA logic (tests only - never touches releases).
-# Release publishing stays in ota-release.yml (schedule + workflow_dispatch).
+# PR/push gate for the shared OTA logic. Release publishing stays in ota-release.yml
+# (schedule + workflow_dispatch only); this workflow never touches releases or tokens
+# beyond contents:read.
 
 on:
   pull_request:
@@ -30,6 +31,7 @@ jobs:
         run: ./tests/run-tests.ps1
 
   integration-tests:
+    # Fixture suite downloads real frozen release artifacts; runs on one OS (matches ota-release.yml).
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
