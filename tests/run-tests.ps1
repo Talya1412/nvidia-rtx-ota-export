@@ -370,6 +370,10 @@ if (Test-WindowsHost) {
         try {
             [System.IO.File]::WriteAllBytes($cliPePath, (New-FakeVersionPe 310 9 1 0))
             $cliOutput = (& $sigTool verify -in $cliPePath 2>&1 | Out-String)
+            # The synthetic PE is intentionally unsigned, so osslsigncode exits non-zero;
+            # the contract under test is argument parsing, not signature validity. Do not let
+            # that expected native exit code become this PowerShell test process's exit code.
+            $global:LASTEXITCODE = 0
             Assert-True 'sig tool: real CLI accepts -in input form' ($cliOutput -and $cliOutput -notmatch '(?i)usage:')
         } finally {
             Remove-Item $cliPePath -Force -ErrorAction SilentlyContinue
