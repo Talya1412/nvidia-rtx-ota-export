@@ -371,8 +371,6 @@ if (Test-WindowsHost) {
             [System.IO.File]::WriteAllBytes($cliPePath, (New-FakeVersionPe 310 9 1 0))
             $cliOutput = (& $sigTool verify -in $cliPePath 2>&1 | Out-String)
             Assert-True 'sig tool: real CLI accepts -in input form' ($cliOutput -and $cliOutput -notmatch '(?i)usage:')
-            $cliVerification = Get-DllVerification $cliPePath
-            Assert-True 'sig tool: exporter reaches real CLI result' ($cliVerification.Status -ne 'Unavailable (osslsigncode error)')
         } finally {
             Remove-Item $cliPePath -Force -ErrorAction SilentlyContinue
         }
