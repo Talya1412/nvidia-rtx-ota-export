@@ -203,6 +203,9 @@ Assert-True 'gate: numeric 310.10.0 > 310.9.0 -> publish' (Test-ReleaseTagNewer 
 Assert-True 'gate: dlss equal, sl newer -> publish' (Test-ReleaseTagNewer '310.9.0' '2.15.0' 'v310.9.0-sl2.14.0')
 Assert-True 'gate: dlss equal, sl older -> skip' (-not (Test-ReleaseTagNewer '310.9.0' '2.13.0' 'v310.9.0-sl2.14.0'))
 Assert-True 'gate: unparseable existing tag does not block' (Test-ReleaseTagNewer '310.9.0' '2.14.0' 'some-other-tag')
+Assert-True 'tag parse: optional dlssnr part' ((Get-ReleaseTagVersion 'v310.9.1-sl2.14.1-nr310.8.0').Dlssnr -eq '310.8.0')
+Assert-True 'gate: dlssnr newer publishes same main version' (Test-ReleaseTagNewer '310.9.1' '2.14.1' 'v310.9.1-sl2.14.1-nr310.8.0' '310.9.0')
+Assert-True 'gate: same dlssnr does not republish' (-not (Test-ReleaseTagNewer '310.9.1' '2.14.1' 'v310.9.1-sl2.14.1-nr310.8.0' '310.8.0'))
 
 # ---------------------------------------------------------------- multi-source winners
 $win = Select-ComponentWinners @(
@@ -310,6 +313,116 @@ Assert-True 'winners: older DLSS-only source loses to official with same SL' ((S
 Assert-True 'dlssnr: mirror newer than pinned universal wins (newest-wins)' ((Select-DlssnrBuild @(@{ Tag = 'pinned-universal'; Version = '310.8.0'; Pass = $true }, @{ Tag = 'dlssnr-310.9.0'; Version = '310.9.0'; Pass = $true })) -eq 'dlssnr-310.9.0')
 Assert-True 'dlssnr: version tie prefers pinned universal (listed first)' ((Select-DlssnrBuild @(@{ Tag = 'pinned-universal'; Version = '310.8.0'; Pass = $true }, @{ Tag = 'dlssnr-310.8.0'; Version = '310.8.0'; Pass = $true })) -eq 'pinned-universal')
 
+
+# ---------------------------------------------------------------- proton NGX cache roots (Linux/macOS)
+$protonHome = Join-Path (Get-TempRoot) ('ota-proton-' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $protonHome -Force | Out-Null
+    $steamNgx = "$protonHome/.steam/steam/steamapps/compatdata/1091500/pfx/drive_c/users/steamuser/AppData/Local/NVIDIA/NGX"
+    $flatNgx  = "$protonHome/.var/app/com.valvesoftware.Steam/.steam/steam/steamapps/compatdata/1091500/pfx/drive_c/users/steamuser/AppData/Local/NVIDIA/NGX"
+    $wineNgx  = "$protonHome/.wine/drive_c/users/hoang/AppData/Local/NVIDIA/NGX"
+    foreach ($d in @($steamNgx, $flatNgx, $wineNgx)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    New-Item -ItemType Directory -Path "$protonHome/.steam/steam/steamapps/compatdata/999/pfx/drive_c/users/steamuser" -Force | Out-Null
+
+    $roots = @(Get-ProtonOtaCacheRoots -HomeDir $protonHome)
+    Assert-True 'proton roots: steam compatdata prefix found' ($roots -contains ($steamNgx -replace '\\', '/'))
+    Assert-True 'proton roots: flatpak steam prefix found' ($roots -contains ($flatNgx -replace '\\', '/'))
+    Assert-True 'proton roots: plain wine prefix found' ($roots -contains ($wineNgx -replace '\\', '/'))
+    Assert-True 'proton roots: prefix without NGX dir excluded' (@($roots | Where-Object { $_ -like '*compatdata/999*' }).Count -eq 0)
+    Assert-True 'proton roots: all returned paths exist' (@($roots | Where-Object { -not (Test-Path $_) }).Count -eq 0)
+    Assert-True 'proton roots: forward slashes everywhere' (@($roots | Where-Object { $_.Contains([char]92) }).Count -eq 0)
+
+    $empty = @(Get-ProtonOtaCacheRoots -HomeDir (Join-Path $protonHome 'empty'))
+    Assert-True 'proton roots: empty home -> empty list' ($empty.Count -eq 0)
+} finally {
+    Remove-Item $protonHome -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------- osslsigncode output parsing (non-Windows signatures)
+$osslOkOut = @'
+Message digest algorithm  : SHA256
+Current message digest    : 0A9F10FB285BA0064B5537023F8BC9E06E173801
+Calculated message digest : 0A9F10FB285BA0064B5537023F8BC9E06E173801
+Signature verification: ok
+
+Number of signers: 1
+Signer #0:
+    Subject: /C=US/ST=California/L=Santa Clara/O=NVIDIA Corporation/CN=NVIDIA Corporation
+    Issuer : /C=US/O=DigiCert Inc/CN=DigiCert EV Code Signing CA
+'@
+$parsedOk = ConvertFrom-OsslSigncodeOutput $osslOkOut
+Assert-True 'ossl parse: ok verdict -> Valid' ($parsedOk.Status -eq 'Valid')
+Assert-True 'ossl parse: NVIDIA signer captured' ($parsedOk.Signer -match 'NVIDIA Corporation')
+Assert-True 'ossl parse: failed verdict -> HashMismatch' ((ConvertFrom-OsslSigncodeOutput "Signature verification: failed`nSerial: 01").Status -eq 'HashMismatch')
+Assert-True 'ossl parse: no verdict -> Invalid' ((ConvertFrom-OsslSigncodeOutput 'garbage output only').Status -eq 'Invalid')
+$parsedEmpty = ConvertFrom-OsslSigncodeOutput ''
+Assert-True 'ossl parse: empty -> Invalid without signer' ($parsedEmpty.Status -eq 'Invalid' -and -not $parsedEmpty.Signer)
+
+# ---------------------------------------------------------------- signature tool resolution
+$sigTool = Resolve-SignatureTool
+if (Test-WindowsHost) {
+    Assert-True 'sig tool: Windows never resolves osslsigncode' ($null -eq $sigTool)
+} else {
+    Assert-True 'sig tool: non-Windows resolves to null or a real osslsigncode' ($null -eq $sigTool -or (Test-Path $sigTool))
+}
+
+# ---------------------------------------------------------------- GPU family mapping (dlssnr per-GPU picker)
+Assert-True 'gpu family: RTX 4070 -> RTX40' ((ConvertTo-GpuFamily 'NVIDIA GeForce RTX 4070') -eq 'RTX40')
+Assert-True 'gpu family: RTX 2080 Ti -> RTX20' ((ConvertTo-GpuFamily 'NVIDIA GeForce RTX 2080 Ti') -eq 'RTX20')
+Assert-True 'gpu family: RTX 5090 -> RTX50' ((ConvertTo-GpuFamily 'RTX 5090') -eq 'RTX50')
+Assert-True 'gpu family: RTX 3070 Laptop GPU -> RTX30' ((ConvertTo-GpuFamily 'RTX 3070 Laptop GPU') -eq 'RTX30')
+Assert-True 'gpu family: GTX 1650 -> null' ($null -eq (ConvertTo-GpuFamily 'NVIDIA GeForce GTX 1650'))
+Assert-True 'gpu family: empty -> null' ($null -eq (ConvertTo-GpuFamily ''))
+Assert-True 'gpu family: non-NVIDIA -> null' ($null -eq (ConvertTo-GpuFamily 'AMD Radeon RX 7900 XTX'))
+
+Assert-True 'dlssnr suffix: matching family compatible' (Test-MirrorSuffixCompatible 'dlssnr-310.8.0-RTX40' 'RTX40')
+Assert-True 'dlssnr suffix: wrong family incompatible' (-not (Test-MirrorSuffixCompatible 'dlssnr-310.8.0-RTX50' 'RTX40'))
+Assert-True 'dlssnr suffix: 4-digit model suffix maps to series' (Test-MirrorSuffixCompatible 'dlssnr-310.8.0-RTX4090' 'RTX40')
+Assert-True 'dlssnr suffix: no suffix compatible' (Test-MirrorSuffixCompatible 'dlssnr-310.8.0' 'RTX40')
+Assert-True 'dlssnr suffix: unknown family compatible' (Test-MirrorSuffixCompatible 'dlssnr-310.8.0-RTX50' '')
+Assert-True 'dlssnr suffix: pinned universal compatible' (Test-MirrorSuffixCompatible 'pinned-universal' 'RTX40')
+Assert-True 'dlssnr suffix: case-insensitive' (Test-MirrorSuffixCompatible 'dlssnr-310.8.0-rtx40' 'RTX40')
+Assert-True 'dlssnr suffix: non-GPU suffix compatible' (Test-MirrorSuffixCompatible 'dlssnr-310.8.0-SF' 'RTX40')
+$gpuOrdered = @(Sort-DlssnrCandidates @(
+    @{ Tag = 'dlssnr-310.9.0-RTX50'; SortVersion = '310.9.0'; Order = 0 }
+    @{ Tag = 'dlssnr-310.8.0-RTX40'; SortVersion = '310.8.0'; Order = 1 }
+    @{ Tag = 'dlssnr-310.7.0'; SortVersion = '310.7.0'; Order = 2 }
+) 'RTX40')
+Assert-True 'dlssnr ordering: compatible family beats newer wrong-family build' ($gpuOrdered[0].Tag -eq 'dlssnr-310.8.0-RTX40')
+Assert-True 'dlssnr ordering: unsuffixed candidate remains compatible' ($gpuOrdered[1].Tag -eq 'dlssnr-310.7.0')
+
+
+# ---------------------------------------------------------------- versions.json manifest builder
+$sumLines = @(
+    "nvngx_dlss.dll`t310.9.1`t$('a' * 64)",
+    "sl.common.dll`t2.14.1`t$('b' * 64)"
+)
+$archList = @(
+    [pscustomobject]@{ name = 'streamline-ota-310.9.1-sl2.14.1.7z'; sha256 = $('c' * 64) },
+    [pscustomobject]@{ name = 'nvngx_dlssnr_310.8.0.7z'; sha256 = $('d' * 64) }
+)
+$compMap = @{
+    dlss   = @{ version = '310.9.1'; source = 'sdk-streamline' }
+    sl     = @{ version = '2.14.1';  source = 'sdk-streamline' }
+    dlssnr = @{ version = '310.8.0'; source = 'pinned-universal' }
+}
+$feedMap = @{ staging = '310.9.0/2.14.0'; production = '310.7.128/2.12.128'; sdk = '2.14.1' }
+$versionsJson = ConvertTo-OtaVersionsJson -Tag 'v310.9.1-sl2.14.1' -Components $compMap -ChecksumLines $sumLines -Archives $archList -FeedState $feedMap
+$vdoc = $versionsJson | ConvertFrom-Json
+Assert-True 'versions.json: parses back' ($null -ne $vdoc)
+Assert-True 'versions.json: schema 1' ($vdoc.schema -eq 1)
+Assert-True 'versions.json: release tag recorded' ($vdoc.release -eq 'v310.9.1-sl2.14.1')
+Assert-True 'versions.json: generatedAt present' (-not [string]::IsNullOrEmpty($vdoc.generatedAt))
+Assert-True 'versions.json: dlss component version+source' ($vdoc.components.dlss.version -eq '310.9.1' -and $vdoc.components.dlss.source -eq 'sdk-streamline')
+Assert-True 'versions.json: dlssnr component recorded' ($vdoc.components.dlssnr.version -eq '310.8.0' -and $vdoc.components.dlssnr.source -eq 'pinned-universal')
+Assert-True 'versions.json: files parsed from checksum lines' ($vdoc.files.'nvngx_dlss.dll'.sha256 -eq ('a' * 64) -and $vdoc.files.'nvngx_dlss.dll'.version -eq '310.9.1')
+Assert-True 'versions.json: archives listed with hashes' ($vdoc.archives.Count -eq 2 -and $vdoc.archives[1].name -eq 'nvngx_dlssnr_310.8.0.7z')
+Assert-True 'versions.json: feeds included' ($vdoc.feeds.staging -eq '310.9.0/2.14.0')
+
+$compNoSnr = @{ dlss = @{ version = '310.9.1'; source = 'sdk-streamline' }; sl = @{ version = '2.14.1'; source = 'sdk-streamline' } }
+$vdoc2 = ConvertTo-OtaVersionsJson -Tag 'v310.9.1-sl2.14.1' -Components $compNoSnr -ChecksumLines $sumLines -Archives $archList[0..0] -FeedState $feedMap | ConvertFrom-Json
+Assert-True 'versions.json: dlssnr optional' ($null -eq $vdoc2.components.dlssnr)
+Assert-True 'versions.json: single archive list' ($vdoc2.archives.Count -eq 1)
 
 # ---------------------------------------------------------------- integration suite (frozen release fixtures)
 # Runs with -Integration (also wired into .github/workflows/ota-release.yml). Downloads the real

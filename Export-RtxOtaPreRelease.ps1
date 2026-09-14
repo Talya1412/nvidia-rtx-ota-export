@@ -99,8 +99,9 @@ if (Test-WindowsHost) {
     ) | Where-Object { $_ }
     $OtaCacheRoots = @($OtaCacheRoots | Select-Object -Unique)
 } else {
-    # no NGX cache on Linux/macOS (and $env:ProgramData/$env:APPDATA are unset there)
-    $OtaCacheRoots = @()
+    # Linux/macOS: NVIDIA's updater runs inside Windows game prefixes (Steam Proton / Wine),
+    # so the same NGX cache is probed inside every existing prefix (read-only).
+    $OtaCacheRoots = @(Get-ProtonOtaCacheRoots)
 }
 
 if (-not $OutDir) {
@@ -163,7 +164,21 @@ function Get-DllVerification([string]$Path) {
             if ($sig.SignerCertificate) { $signer = [string]$sig.SignerCertificate.Subject }
         } catch { }
     } else {
-        $status = 'Unavailable (non-Windows)'
+        # Non-Windows: real Authenticode verification via osslsigncode when installed
+        # (apt/brew); without it fall back to the UNVERIFIED (non-Windows) report.
+        $sigTool = Resolve-SignatureTool
+        if ($sigTool) {
+            try {
+                $osslOut = (& $sigTool verify -in $Path 2>&1 | Out-String)
+                $ossl = ConvertFrom-OsslSigncodeOutput $osslOut
+                $status = $ossl.Status
+                $signer = $ossl.Signer
+            } catch {
+                $status = 'Unavailable (osslsigncode error)'
+            }
+        } else {
+            $status = 'Unavailable (non-Windows)'
+        }
     }
     $policy = Get-DllAcceptancePolicy $true $status $signer
     if ($policy.Label -like 'UNVERIFIED*') {
@@ -509,8 +524,11 @@ if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
         $order++
         $snrCandidates += @{ Tag = $m.Tag; Version = $m.Version; SortVersion = $m.SortVersion; Order = $order; Kind = 'mirror'; Cand = $m }
     }
-    $snrOrdered = @($snrCandidates | Sort-Object -Property @{ Expression = { [version]$_.SortVersion }; Descending = $true },
-                                                @{ Expression = { $_.Order } })
+    # compatible-first, then newest: a mirror build suffixed for a different GPU family must
+    # not outrank a universal/compatible build by version alone (wrong-family builds may not
+    # even load). No GPU family detected -> everything compatible (plain newest-wins).
+    $gpuFamily = Get-LocalGpuFamily
+    $snrOrdered = @(Sort-DlssnrCandidates $snrCandidates $gpuFamily)
     $snrAccepted = $null
     $snrRejected = @()
     foreach ($cand in $snrOrdered) {
@@ -561,6 +579,12 @@ if ($Channel -eq 'Newest' -and -not $SkipGitHubCheck) {
         $dlssnrNote += "- The pinned universal build ($($unverifiedSpec.Version)) is still available unchanged; this release ships the newer build above.`n"
     }
     foreach ($line in $snrRejected) { $dlssnrNote += "$line`n" }
+    if ($gpuFamily) {
+        $dlssnrNote += "- Local GPU family: $gpuFamily - builds suffixed for other families are deprioritized; universal/unsuffixed builds stay preferred.`n"
+    }
+    if ($snrAccepted) {
+        Add-Content -Path (Join-Path $OutDir 'export-sources.txt') -Value "dlssnr=$($snrAccepted.SortVersion)=$($snrAccepted.Tag)" -Encoding Ascii
+    }
 }
 if ($dlssnrNote) {
     $dlssnrNotePath = Join-Path $OutDir 'dlssnr-notes.txt'

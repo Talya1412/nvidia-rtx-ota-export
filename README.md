@@ -25,9 +25,9 @@ nvngx_dlss.dll      DLSS Super Resolution   (newest available build, e.g. 310.9.
 nvngx_dlssd.dll     DLSS Ray Reconstruction
 nvngx_dlssg.dll     DLSS Frame Generation
 sl.common.dll       Streamline 2.x runtime plugins
-sl.dlss.dll / sl.dlss_d.dll / sl.dlss_g.dll / sl.deepdvc.dll / sl.directsr.dll / sl.nis.dll / sl.nvperf.dll / sl.pcl.dll / sl.reflex.dll
+sl.dlss.dll / sl.dlss_d.dll / sl.dlss_g.dll / sl.deepdvc.dll / sl.interposer.dll / sl.directsr.dll / sl.nis.dll / sl.nvperf.dll / sl.pcl.dll / sl.reflex.dll
 export-summary.txt  per-file version + signature status + SHA-256
-export-sources.txt  which feed won each component (dlss=/sl=) + all feeds compared
+export-sources.txt  which feed won each component (dlss=/sl=/dlssnr=) + all feeds compared
 ```
 
 > `Newest` also packages DLSS 5 Neural Rendering as a separate per-GPU 7z asset (`nvngx_dlssnr_310.8.0.7z`):
@@ -63,6 +63,8 @@ It calls `New-OtaRelease.ps1`, which:
 5. runs the **fixture integration tests** first (`tests/run-tests.ps1 -Integration`): downloads the
    frozen release artifacts listed in `tests/fixtures/manifest.json`, verifies every archive
    SHA-256, and validates DLL count, FileVersions, and dependency consistency of the shipped sets.
+   Each published release also includes `versions.json`, a machine-readable manifest with component
+   provenance, per-file hashes, archive hashes, and a stable URL at `releases/latest/download/versions.json`.
 
 Local run (uses your `gh` login):
 
@@ -88,6 +90,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Export-RtxOtaPreRelease.ps1 
 ```
 
 Or double-click `run-export.bat`.
+
+## Use with DLSS Swapper
+
+1. Download the `streamline-ota-*.7z` asset from the latest release.
+2. Extract it to a temporary folder; keep the flat DLL layout unchanged.
+3. In DLSS Swapper, use its import-from-folder/file flow to import the DLLs you want to test,
+   then apply them to a game. The exporter does not modify game folders itself.
+4. Tool authors can consume `versions.json` from
+   `https://github.com/Talya1412/nvidia-rtx-ota-export/releases/latest/download/versions.json`
+   instead of scraping release notes. It includes the exact SHA-256 for every DLL and archive.
+
+The main DLL set is sourced from NVIDIA OTA/official SDK feeds and checked against NVIDIA's
+sidecar hashes where available. The separately pinned `dlssnr` artifact is explicitly labeled as
+user-supplied and protected by its immutable SHA-256 pin; do not treat arbitrary community DLL
+manifests as equivalent.
 
 ## How it works
 
@@ -131,9 +148,11 @@ SDK — three independent origins agreeing on the same production bytes.
 - Every exported DLL must be a valid PE/MZ image. Authenticode status is recorded as
   `Valid (NVIDIA)` or `UNVERIFIED (...)`, but it is not a hard reject for allowlisted
   DLSS/Streamline sources. OTA payloads still require NVIDIA's SHA-256 sidecar.
-- **dlssnr ships newest-wins**: the user-pinned universal build (immutable SHA-256 `e67dee20…`,
-  310.8.0) is hosted as an asset of this repo's own releases (user-supplied, not an NVIDIA feed)
-  and races the rhi-repo `dlssnr-*` mirror builds; the newest PE-valid candidate is packaged.
+- **dlssnr ships compatible-first, then newest**: the user-pinned universal build (immutable
+  SHA-256 `e67dee20…`, 310.8.0) is hosted as an asset of this repo's own releases (user-supplied,
+  not an NVIDIA feed) and races the rhi-repo `dlssnr-*` mirror builds. When `nvidia-smi` identifies
+  an RTX family, a matching or unsuffixed candidate outranks a newer build suffixed for another
+  family; with no detectable GPU, the original newest-wins ordering is preserved.
   A pinned-universal failure falls through to mirrors automatically. All archives ship as **7z**;
   the UNVERIFIED Authenticode status of these builds is documented in the release notes and
   `dlssnr-notes.txt`, not in the filename.
@@ -145,7 +164,8 @@ SDK — three independent origins agreeing on the same production bytes.
 - 7-Zip itself is supply-chain controlled: trusted local installs are used when present;
   otherwise the official standalone `7zr.exe` is downloaded from `7-zip.org` and verified against
   an exact SHA-256 pin (`Get-Pinned7zrSpec`) before any execution — a mismatched binary is refused.
-- Requires Windows PowerShell 5.1 or PowerShell 7 (Windows/Linux/macOS) and internet access. No GPU is needed. Authenticode status is only available on Windows; on Linux/macOS every DLL is reported as `UNVERIFIED (Unavailable (non-Windows))` and only the PE gate plus (for OTA payloads) the SHA-256 sidecar apply.
+- Requires Windows PowerShell 5.1 or PowerShell 7 (Windows/Linux/macOS) and internet access. No GPU is needed. On Linux/macOS, install `osslsigncode` when real Authenticode verification is desired; the exporter reports `Valid (NVIDIA)` or `UNVERIFIED (...)` from that tool. Without it, the fallback is `UNVERIFIED (Unavailable (non-Windows))`; the PE gate and (for OTA payloads) SHA-256 sidecar still apply.
+- On Linux, the read-only OTA cache rescue path also scans standard Steam Proton and plain Wine prefixes under the user's home directory; no game files or registry hives are modified.
 - Endpoint provenance and the payload-layout reverse engineering draw on
   [scubamount/dlss-version-toolkit](https://github.com/scubamount/dlss-version-toolkit) (Apache-2.0).
 

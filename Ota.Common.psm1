@@ -57,6 +57,28 @@ function Find-OtaCachedPayload([string[]]$Roots, [string]$Section, [string]$Pack
     return $null
 }
 
+# Linux/macOS NGX cache roots: NVIDIA's own updater (nvngx_update.exe) runs inside Windows game
+# prefixes (Steam Proton / plain Wine), so the driver's local OTA cache lives at the standard
+# Windows AppData path INSIDE each prefix. Enumerate the prefixes that exist and return their NGX
+# cache roots (forward slashes - matching Find-OtaCachedPayload). Read-only; never created.
+function Get-ProtonOtaCacheRoots([string]$HomeDir) {
+    if (-not $HomeDir) { $HomeDir = $env:HOME }
+    if (-not $HomeDir -or -not (Test-Path $HomeDir)) { return @() }
+    $patterns = @(
+        '.steam/steam/steamapps/compatdata/*/pfx/drive_c/users/*/AppData/Local/NVIDIA/NGX',
+        '.local/share/Steam/steamapps/compatdata/*/pfx/drive_c/users/*/AppData/Local/NVIDIA/NGX',
+        '.var/app/com.valvesoftware.Steam/.steam/steam/steamapps/compatdata/*/pfx/drive_c/users/*/AppData/Local/NVIDIA/NGX',
+        '.wine/drive_c/users/*/AppData/Local/NVIDIA/NGX'
+    )
+    $roots = @()
+    foreach ($pat in $patterns) {
+        foreach ($hit in @(Get-Item (Join-Path $HomeDir $pat) -ErrorAction SilentlyContinue)) {
+            if ($hit -and $hit.PSIsContainer) { $roots += ($hit.FullName -replace '\\', '/') }
+        }
+    }
+    return @($roots | Select-Object -Unique)
+}
+
 # Lowercase hex SHA-256 via the .NET API - deliberately NOT the Get-FileHash cmdlet, which
 # disappears on hosts where PowerShell module autoloading is broken (observed on real machines).
 function Get-FileSha256([string]$Path) {
@@ -137,6 +159,50 @@ function Select-DlssnrBuild([object[]]$Candidates) {
         if (-not $best -or $v -gt $bestV) { $best = $c.Tag; $bestV = $v }
     }
     return $best
+}
+
+# Map an nvidia-smi GPU name to a series family used by dlssnr mirror tags: 'RTX 4070' ->
+# 'RTX40' (first digit of the model number). GTX / unknown / non-NVIDIA -> $null (family
+# unknown = every candidate compatible, preserving plain newest-wins behaviour).
+function ConvertTo-GpuFamily([string]$GpuName) {
+    if (-not $GpuName) { return $null }
+    if ($GpuName -match '(?i)RTX\s*(\d)\d{3}') { return "RTX$($Matches[1])0" }
+    return $null
+}
+
+# dlssnr mirror tags carry GPU-family suffixes (-RTX40, -RTX4090, ...). A build suffixed for a
+# DIFFERENT family must not outrank a universal one just by being newer (it may not even load),
+# so compatibility is decided BEFORE version. No suffix / no known family -> compatible.
+function Test-MirrorSuffixCompatible([string]$Tag, [string]$Family) {
+    if (-not $Family) { return $true }
+    if (-not $Tag) { return $true }
+    if ($Tag -match '(?i)-(RTX|GTX)(\d{2,4})$') {
+        return ("{0}{1}0" -f $Matches[1], $Matches[2].Substring(0, 1)) -ieq $Family
+    }
+    return $true
+}
+
+# Best-effort local GPU family via nvidia-smi (ships with the driver on every OS). Any failure
+# (tool missing, no NVIDIA GPU, non-zero exit) -> $null.
+function Get-LocalGpuFamily {
+    try {
+        $c = Get-Command 'nvidia-smi' -ErrorAction SilentlyContinue
+        if (-not $c) { return $null }
+        $out = & $c.Source --query-gpu=name --format=csv,noheader 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
+        return ConvertTo-GpuFamily ([string]@($out)[0])
+    } catch { return $null }
+}
+
+# Order dlssnr candidates by GPU compatibility first, then numeric version, then source order.
+# Unknown GPU family keeps every candidate compatible, preserving newest-wins behavior.
+function Sort-DlssnrCandidates([object[]]$Candidates, [string]$GpuFamily) {
+    foreach ($cand in @($Candidates)) {
+        if ($cand) { $cand.IsCompatible = Test-MirrorSuffixCompatible $cand.Tag $GpuFamily }
+    }
+    return @($Candidates | Sort-Object -Property @{ Expression = { -not $_.IsCompatible } },
+                                      @{ Expression = { [version]$_.SortVersion }; Descending = $true },
+                                      @{ Expression = { $_.Order } })
 }
 
 # Per-component newest across sources. Candidates: @{ Source; Dlss; Sl } where $Sl may be $null
@@ -271,35 +337,46 @@ function Get-SdkZipAssetName([string[]]$AssetNames) {
     return (@($AssetNames) | Where-Object { $_ -match '\.zip$' } | Select-Object -First 1)
 }
 
-# 'v310.9.0-sl2.14.0' -> Dlss='310.9.0', Sl='2.14.0'; anything else -> $null
+# 'v310.9.0-sl2.14.0[-nr310.8.0]' -> Dlss/Sl plus optional Dlssnr; anything else -> $null
 function Get-ReleaseTagVersion([string]$Tag) {
-    if ($Tag -notmatch '^v(\d+(?:\.\d+)+)-sl(\d+(?:\.\d+)+)$') { return $null }
-    return [pscustomobject]@{ Dlss = $Matches[1]; Sl = $Matches[2] }
+    if ($Tag -notmatch '^v(\d+(?:\.\d+)+)-sl(\d+(?:\.\d+)+)(?:-nr(\d+(?:\.\d+)+))?$') { return $null }
+    return [pscustomobject]@{ Dlss = $Matches[1]; Sl = $Matches[2]; Dlssnr = $Matches[3] }
 }
 
-# Among candidate release tags, the one with the highest (Dlss, Sl) tuple; $null when none parse.
+# Among candidate release tags, the one with the highest (Dlss, Sl, optional Dlssnr) tuple; $null when none parse.
 function Get-NewestReleaseTag([string[]]$Tags) {
     $best = $null; $bestV = $null
     foreach ($t in @($Tags)) {
         if (-not $t) { continue }
         $v = Get-ReleaseTagVersion $t
         if (-not $v) { continue }
-        if (-not $best -or (Compare-OtaNewer $v.Dlss $bestV.Dlss) -or ($v.Dlss -eq $bestV.Dlss -and (Compare-OtaNewer $v.Sl $bestV.Sl))) {
+        $nrNewer = $false
+        if ($v.Dlss -eq $bestV.Dlss -and $v.Sl -eq $bestV.Sl -and $v.Dlssnr -and $bestV.Dlssnr) {
+            $nrNewer = Compare-OtaNewer $v.Dlssnr $bestV.Dlssnr
+        } elseif ($v.Dlss -eq $bestV.Dlss -and $v.Sl -eq $bestV.Sl -and $v.Dlssnr -and -not $bestV.Dlssnr) {
+            $nrNewer = $true
+        }
+        if (-not $best -or (Compare-OtaNewer $v.Dlss $bestV.Dlss) -or
+            ($v.Dlss -eq $bestV.Dlss -and (Compare-OtaNewer $v.Sl $bestV.Sl)) -or
+            $nrNewer) {
             $best = $t; $bestV = $v
         }
     }
     return $best
 }
 
-# Gate: true only when the candidate (Dlss, Sl) is strictly newer than an existing release tag.
+# Gate: true only when the candidate (Dlss, Sl, optional Dlssnr) is strictly newer than an existing release tag.
 # Equal version (already released, from any source) or older -> false, so a stale state can
 # never be published and pull 'Latest release' backwards.
-function Test-ReleaseTagNewer([string]$Dlss, [string]$Sl, [string]$ExistingTag) {
+function Test-ReleaseTagNewer([string]$Dlss, [string]$Sl, [string]$ExistingTag, [string]$Dlssnr = '') {
     $v = Get-ReleaseTagVersion $ExistingTag
     if (-not $v) { return $true }
     if (Compare-OtaNewer $Dlss $v.Dlss) { return $true }
     if ($Dlss -ne $v.Dlss) { return $false }
-    return [bool](Compare-OtaNewer $Sl $v.Sl)
+    if (Compare-OtaNewer $Sl $v.Sl) { return $true }
+    if ($Sl -ne $v.Sl -or -not $Dlssnr) { return $false }
+    if (-not $v.Dlssnr) { return $true }
+    return [bool](Compare-OtaNewer $Dlssnr $v.Dlssnr)
 }
 
 # Core DLL policy: sources are allowlisted upstream, so the file gate requires a PE/MZ image and
@@ -314,6 +391,31 @@ function Get-DllAcceptancePolicy([bool]$IsPe, [string]$SignatureStatus, [string]
     }
     $status = if ($SignatureStatus) { $SignatureStatus } else { 'Unknown' }
     return [pscustomobject]@{ Accepted = $true; Label = "UNVERIFIED ($status)" }
+}
+
+# Parse `osslsigncode verify` output into the same shape Get-AuthenticodeSignature provides:
+# Status ('Valid' / 'HashMismatch' / 'Invalid') + signer subject. 'ok' is the only passing
+# verdict; a present-but-failed verdict maps to HashMismatch; absent verdict -> Invalid.
+function ConvertFrom-OsslSigncodeOutput([string]$Text) {
+    $status = 'Invalid'
+    $signer = ''
+    if ($Text) {
+        if ($Text -match '(?m)^\s*Signature verification:\s*(\S+)') {
+            if ($Matches[1].ToLowerInvariant() -eq 'ok') { $status = 'Valid' } else { $status = 'HashMismatch' }
+        }
+        if ($Text -match '(?m)^\s*Subject\s*:\s*(.+?)\s*$') { $signer = $Matches[1] }
+    }
+    return [pscustomobject]@{ Status = $status; Signer = $signer }
+}
+
+# Signature tool for non-Windows hosts. Deliberately use-if-present ONLY: nothing beyond the
+# pinned 7-Zip is ever downloaded, and osslsigncode ships no official prebuilt Linux/macOS
+# binary to pin. Absent tool -> callers fall back to the UNVERIFIED (non-Windows) report.
+function Resolve-SignatureTool {
+    if (Test-WindowsHost) { return $null }
+    $c = Get-Command 'osslsigncode' -ErrorAction SilentlyContinue
+    if ($c) { return $c.Source }
+    return $null
 }
 
 # Exact, case-insensitive SHA-256 pin for a deliberately selected unverified artifact.
@@ -384,22 +486,31 @@ function Resolve-7ZipTool {
         }
     } else {
         $tarball = Join-Path $tmpRoot ([System.IO.Path]::GetFileName($spec.Url))
-        if (-not (Test-Path $tool) -or -not (Test-Path $tarball) -or (Get-Item $tarball).Length -ne $spec.Size) {
+        if (-not (Test-Path $tarball) -or (Get-Item $tarball).Length -ne $spec.Size) {
             New-Item -ItemType Directory $tmpRoot -Force | Out-Null
             Invoke-WebRequest -Uri $spec.Url -OutFile $tarball -UseBasicParsing
-            if (-not (Test-Sha256Pin (Get-FileSha256 $tarball) $spec.Sha256)) {
-                Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
-                throw "Pinned 7-Zip tarball failed SHA-256 verification: expected $($spec.Sha256) - refusing to extract or execute."
-            }
-            tar -xf $tarball -C $tmpRoot
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tool)) { throw "Failed to extract the pinned 7-Zip tarball (system 'tar' missing or unreadable?): $tarball" }
+        }
+        # The tarball pin is the trust anchor for both the archive and its extracted 7zzs.
+        # Recheck it on every call and re-extract every call so a tampered cached inner tool
+        # cannot execute even when the pinned tarball itself is intact.
+        if (-not (Test-Sha256Pin (Get-FileSha256 $tarball) $spec.Sha256)) {
+            Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+            throw "Pinned 7-Zip tarball failed SHA-256 verification: expected $($spec.Sha256) - refusing to extract or execute."
+        }
+        New-Item -ItemType Directory $tmpRoot -Force | Out-Null
+        if (Test-Path $tool) { Remove-Item $tool -Force }
+        tar -xf $tarball -C $tmpRoot
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tool)) { throw "Failed to extract the pinned 7-Zip tarball (system 'tar' missing or unreadable?): $tarball" }
+    }
+    if ($spec.Kind -eq 'exe') {
+        $actual = Get-FileSha256 $tool
+        if (-not (Test-Sha256Pin $actual $spec.Sha256)) {
+            Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+            throw "Pinned 7-Zip tool failed SHA-256 verification: expected $($spec.Sha256), got $actual - refusing to execute."
         }
     }
-    $actual = Get-FileSha256 $tool
-    if (-not (Test-Sha256Pin $actual $spec.Sha256) -and $spec.Kind -ne 'tarxz') {
-        Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
-        throw "Pinned 7-Zip tool failed SHA-256 verification: expected $($spec.Sha256), got $actual - refusing to execute."
-    }
+    # tar.xz platforms re-verify the pinned archive and re-extract it above on every call;
+    # that verified archive is the integrity pin for the extracted static 7zzs binary.
     return $tool
 }
 
@@ -454,6 +565,29 @@ function Expand-SlSdkPayload([string]$ZipPath, [string]$DestDir, [string]$EntryP
 # Path of the PowerShell host running this script (pwsh or powershell.exe), so child scripts
 # are re-invoked under the same host; editors/embedded hosts (e.g. powershell_ise.exe) fall
 # back to the console host by edition.
+# Machine-readable manifest published as the versions.json release asset. Consumers (DLSS
+# Swapper users, updaters, dashboards) get per-component versions + provenance + hashes without
+# scraping release notes. $Components: @{ dlss = @{version;source}; sl = ...; dlssnr = ... }
+# (dlssnr optional). $ChecksumLines: "name`tshort-version`tsha256". $Archives: @{name;sha256}.
+function ConvertTo-OtaVersionsJson([string]$Tag, $Components, [string[]]$ChecksumLines, $Archives, [hashtable]$FeedState) {
+    $files = [ordered]@{}
+    foreach ($line in @($ChecksumLines)) {
+        if (-not $line) { continue }
+        $p = $line -split "`t"
+        if ($p.Count -ge 3) { $files[$p[0]] = @{ version = $p[1]; sha256 = $p[2] } }
+    }
+    $doc = [ordered]@{
+        schema      = 1
+        generatedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        release     = $Tag
+        components  = $Components
+        files       = $files
+        archives    = @($Archives)
+        feeds       = $FeedState
+    }
+    return ($doc | ConvertTo-Json -Depth 6)
+}
+
 function Get-PowerShellHostPath {
     $p = (Get-Process -Id $PID).Path
     if ($p -and ((Split-Path -Leaf $p) -match '^(pwsh|powershell)(\.exe)?$')) { return $p }
@@ -505,5 +639,13 @@ function Get-UnverifiedDlssnrSpec {
     'Get-LatestReleaseTagViaRedirect',
     'Get-DlssRepoAssetName',
     'Test-ProbeStateDiffers',
-    'Test-ReleaseTagNewer'
+    'Test-ReleaseTagNewer',
+    'Get-ProtonOtaCacheRoots',
+    'ConvertFrom-OsslSigncodeOutput',
+    'Resolve-SignatureTool',
+    'ConvertTo-GpuFamily',
+    'Get-LocalGpuFamily',
+    'Test-MirrorSuffixCompatible',
+    'Sort-DlssnrCandidates',
+    'ConvertTo-OtaVersionsJson'
 )

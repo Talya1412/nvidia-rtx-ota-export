@@ -141,13 +141,14 @@ $psExe = Get-PowerShellHostPath
 & $psExe -NoProfile -ExecutionPolicy Bypass -File $exportScript -OutDir $work -Channel $Channel
 if ($LASTEXITCODE -ne 0) { throw 'Export step failed.' }
 $sourcesFile = Join-Path $work 'export-sources.txt'
-$dlssSource = 'unknown'; $slSource = 'unknown'; $feedState = @{}
+$dlssSource = 'unknown'; $slSource = 'unknown'; $dlssnrVer = ''; $dlssnrSource = ''; $feedState = @{}
 if (Test-Path $sourcesFile) {
     foreach ($line in (Get-Content $sourcesFile)) {
         $p = $line -split '=', 3
         if ($p.Count -lt 2) { continue }
         if ($p[0] -eq 'dlss') { $dlssSource = $p[2] }
         elseif ($p[0] -eq 'sl') { $slSource = $p[2] }
+        elseif ($p[0] -eq 'dlssnr') { $dlssnrVer = $p[1]; $dlssnrSource = $p[2] }
         else { $feedState[$p[0]] = $p[1] }
     }
 }
@@ -156,6 +157,7 @@ $dlls = Get-ChildItem $work -Filter '*.dll'
 $dlssVer = ConvertTo-ShortVersion (Get-FilePeVersion (Join-Path $work 'nvngx_dlss.dll'))
 $slVer   = ConvertTo-ShortVersion (Get-FilePeVersion (Join-Path $work 'sl.common.dll'))
 $tag = "v$dlssVer-sl$slVer"
+if ($dlssnrVer) { $tag += "-nr$dlssnrVer" }
 Write-Host "    DLSS $dlssVer / Streamline $slVer -> tag $tag"
 $signatureRows = @()
 if (Test-Path (Join-Path $work 'export-summary.txt')) {
@@ -172,7 +174,7 @@ if (-not $Repo) {
 }
 $existing = gh api --paginate "repos/$Repo/releases?per_page=100" --jq '.[].tag_name' 2>$null
 $maxTag = Get-NewestReleaseTag @($existing)
-if ($maxTag -and -not (Test-ReleaseTagNewer $dlssVer $slVer $maxTag)) {
+if ($maxTag -and -not (Test-ReleaseTagNewer $dlssVer $slVer $maxTag $dlssnrVer)) {
     Write-Host "==> Candidate $tag is not newer than the newest existing release $maxTag. Nothing to do." -ForegroundColor Green
     # persist the probe state so later polls can skip the heavy export again
     if ($probeStatePath -and (Test-Path $probeStatePath)) {
@@ -195,6 +197,20 @@ $short = ConvertTo-ShortVersion (Get-FilePeVersion $_.FullName)
 }
 $checksumsPath = Join-Path $work 'checksums.txt'
 $checksumLines | Set-Content $checksumsPath -Encoding UTF8
+
+# machine-readable manifest (stable URL: releases/latest/download/versions.json)
+$versionsPath = Join-Path $work 'versions.json'
+$archiveEntries = @([pscustomobject]@{ name = $assetName; sha256 = (Get-FileSha256 $assetPath) })
+foreach ($snr in @(Get-ChildItem $work -Filter 'nvngx_dlssnr*.7z' -ErrorAction SilentlyContinue)) {
+    $archiveEntries += [pscustomobject]@{ name = $snr.Name; sha256 = (Get-FileSha256 $snr.FullName) }
+}
+$versionComponents = @{
+    dlss = @{ version = $dlssVer; source = $dlssSource }
+    sl   = @{ version = $slVer;   source = $slSource }
+}
+if ($dlssnrVer) { $versionComponents['dlssnr'] = @{ version = $dlssnrVer; source = $dlssnrSource } }
+ConvertTo-OtaVersionsJson -Tag $tag -Components $versionComponents -ChecksumLines $checksumLines `
+    -Archives $archiveEntries -FeedState $feedState | Set-Content $versionsPath -Encoding UTF8
 
 # ---------------------------------------------------------------- 4. changelog vs previous release
 $prevTag = $maxTag
@@ -277,7 +293,7 @@ $notes | Set-Content $notesPath -Encoding UTF8
 
 # ---------------------------------------------------------------- 5. publish
 Write-Host "==> Creating GitHub release $tag" -ForegroundColor Cyan
-gh release create $tag $assetPath $checksumsPath $snrAssets $probeStatePath `
+gh release create $tag $assetPath $checksumsPath $versionsPath $snrAssets $probeStatePath `
     --repo $Repo `
     --title "NVIDIA RTX OTA $tag" `
     --notes-file $notesPath

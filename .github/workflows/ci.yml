@@ -26,6 +26,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install osslsigncode (non-Windows signature verification)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q osslsigncode
+          else
+            brew install osslsigncode
+          fi
       - name: Unit tests (shared OTA logic)
         shell: pwsh
         run: ./tests/run-tests.ps1
