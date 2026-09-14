@@ -1,3 +1,6 @@
 # scratch output of local runs
 exports/
 *.zip
+
+# local tool state (omp-fabric LCM)
+.local/
