@@ -2,5 +2,6 @@
 exports/
 *.zip
 
-# local tool state (omp-fabric LCM)
+# local tool state (omp harness)
 .local/
+.omp/
