@@ -364,6 +364,19 @@ if (Test-WindowsHost) {
     Assert-True 'sig tool: Windows never resolves osslsigncode' ($null -eq $sigTool)
 } else {
     Assert-True 'sig tool: non-Windows resolves to null or a real osslsigncode' ($null -eq $sigTool -or (Test-Path $sigTool))
+    if ($env:CI -eq 'true') {
+        Assert-True 'sig tool: CI non-Windows installation is present' ($null -ne $sigTool -and (Test-Path $sigTool))
+        $cliPePath = Join-Path (Get-TempRoot) ('osslsigncode-cli-' + [guid]::NewGuid().ToString('N') + '.dll')
+        try {
+            [System.IO.File]::WriteAllBytes($cliPePath, (New-FakeVersionPe 310 9 1 0))
+            $cliOutput = (& $sigTool verify -in $cliPePath 2>&1 | Out-String)
+            Assert-True 'sig tool: real CLI accepts -in input form' ($cliOutput -and $cliOutput -notmatch '(?i)usage:')
+            $cliVerification = Get-DllVerification $cliPePath
+            Assert-True 'sig tool: exporter reaches real CLI result' ($cliVerification.Status -ne 'Unavailable (osslsigncode error)')
+        } finally {
+            Remove-Item $cliPePath -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 # ---------------------------------------------------------------- GPU family mapping (dlssnr per-GPU picker)
