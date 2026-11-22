@@ -172,7 +172,8 @@ if (-not $Repo) {
     $remote = git -C $repoRoot remote get-url origin
     $Repo = ($remote -replace '.*github\.com[:/]', '' -replace '\.git$', '')
 }
-$existing = gh api --paginate "repos/$Repo/releases?per_page=100" --jq '.[].tag_name' 2>$null
+$existing = gh api --paginate "repos/$Repo/releases?per_page=100" --jq '.[].tag_name'
+if ($LASTEXITCODE -ne 0) { throw 'Unable to list existing releases. No release was published.' }
 $maxTag = Get-NewestReleaseTag @($existing)
 if ($maxTag -and -not (Test-ReleaseTagNewer $dlssVer $slVer $maxTag $dlssnrVer)) {
     Write-Host "==> Candidate $tag is not newer than the newest existing release $maxTag. Nothing to do." -ForegroundColor Green
@@ -215,7 +216,7 @@ ConvertTo-OtaVersionsJson -Tag $tag -Components $versionComponents -ChecksumLine
 # ---------------------------------------------------------------- 4. changelog vs previous release
 $prevTag = $maxTag
 $prevSums = if ($prevTag) { Get-PreviousChecksums $Repo $prevTag } else { $null }
-$changed = @(); $added = @(); $unchanged = @()
+$changed = @(); $added = @()
 $prevMap = @{}
 if ($prevSums) {
     foreach ($line in $prevSums) {
@@ -227,7 +228,6 @@ foreach ($line in $checksumLines) {
     $p = $line -split "`t"
     if (-not $prevMap.ContainsKey($p[0])) { $added += $p[0] }
     elseif ($prevMap[$p[0]] -ne $p[2]) { $changed += $p[0] }
-    else { $unchanged += $p[0] }
 }
 
 $ghDlss = Get-LatestReleaseTagViaRedirect 'NVIDIA/DLSS';            if (-not $ghDlss) { $ghDlss = 'unavailable' }
@@ -262,10 +262,11 @@ if (-not $prevTag) {
     $notes += "`n- First tracked release. Baseline: DLSS $dlssVer, Streamline $slVer.`n"
 } else {
     $notes += "`nCompared against ``$prevTag``:`n"
-    if ($changed.Count)  { $notes += ($changed  | ForEach-Object { "- **changed**: ``$_``" }) + "`n" }
-    if ($added.Count)    { $notes += ($added    | ForEach-Object { "- **added**: ``$_``" }) + "`n" }
-    $removed = $prevMap.Keys | Where-Object { $changed -notcontains $_ -and $added -notcontains $_ -and ($checksumLines -notmatch [regex]::Escape("$_`t")) }
-    if ($removed.Count)  { $notes += ($removed  | ForEach-Object { "- **removed**: ``$_``" }) + "`n" }
+    $currentNames = $dlls.Name
+    $removed = @($prevMap.Keys | Where-Object { $_ -notin $currentNames } | Sort-Object)
+    foreach ($name in $changed) { $notes += "- **changed**: ``$name```n" }
+    foreach ($name in $added) { $notes += "- **added**: ``$name```n" }
+    foreach ($name in $removed) { $notes += "- **removed**: ``$name```n" }
     if (-not $changed.Count -and -not $added.Count -and -not $removed.Count) { $notes += "- No file content changed (version bump only).`n" }
 }
 # DLSS 5 Neural Rendering (dlssnr) section when the export produced one
